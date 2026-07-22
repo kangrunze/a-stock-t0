@@ -1,0 +1,58 @@
+# ═══════════════════════════════════════════════════════════════
+# L5 T+0 日内做T — 阈值集中配置
+# ═══════════════════════════════════════════════════════════════
+# 方案 v0.2 第八节："所有阈值集中配置，禁止散落在各脚本里硬编码"
+# 各模块 dataclass 默认值仍保留（作为 fallback），实盘入口优先从此文件加载。
+# 所有阈值均为起始参考值，需回测校准后才能上生产（方案 v0.2 4.3 节）。
+
+# ── 决策层信号参数（t_signal_engine.SignalParams）──
+signal:
+  vwap_dev_atr_multiplier: 0.8      # VWAP 偏离度阈值 = ±0.8 × ATR_intraday（相对值）
+  bb_period: 20                     # 布林带周期
+  bb_std: 2.0                       # 布林带标准差倍数
+  ema_period: 20                    # EMA 周期（位置基准补充）
+  rsi_period: 14
+  rsi_overbought: 70.0              # RSI 超买（辅助，方案 v0.2 起始值）
+  rsi_oversold: 30.0                # RSI 超卖（辅助，方案 v0.2 起始值）
+  kdj_n: 9
+  kdj_m1: 3
+  kdj_m2: 3
+  kdj_overbought: 80.0              # KDJ K 超买（主触发）
+  kdj_oversold: 20.0                # KDJ K 超卖（主触发）
+  trend_filter_enabled: true        # 是否启用 MACD/DMI 趋势过滤
+  adx_trend_threshold: 25.0         # ADX > 此值视为趋势盘
+  vol_ratio_lookback: 5             # 量比当前窗口
+  vol_ratio_baseline: 20            # 量比基准窗口
+  shrink_threshold: 0.8             # 缩量阈值：当前5min量 < 过去20min均量 × 0.8
+  mfi_overbought: 80.0              # MFI 超买（资金超买）
+  mfi_oversold: 20.0                # MFI 超卖（资金超卖）
+  active_sell_pressure: 0.55        # 主动卖占比 > 此值视为卖压
+  active_buy_pressure: 0.55         # 主动买占比 > 此值视为买盘
+  min_rules_to_trigger: 3           # 4 项中至少 3 项满足
+
+# ── 风控参数（t_risk_guard.RiskParams）──
+risk:
+  max_t_size_ratio: 0.5             # 单次T仓位比例上限（底仓的 50%）
+  max_t_trades_per_day: 4           # 每日最大T次数
+  min_capture_spread: 0.006         # 最小预期捕获空间（0.6%，方案 v0.2 起始值）
+  round_trip_cost: 0.001            # 来回成本（0.1%）
+  eod_check_time: "14:50"           # 尾盘平衡检查时间
+
+# ── 市场层情绪分级阈值（market_layer.MarketSnapshot）──
+market:
+  hot_up_limit: 80                  # 涨停 ≥ 此值 且 跌停 ≤ cold_down_limit → HOT
+  cold_up_limit: 20                 # 涨停 ≤ 此值 或 跌停 ≥ cold_down_limit → COLD
+  cold_down_limit: 50               # 跌停 ≥ 此值 → COLD
+  cool_up_ratio: 30                 # 上涨占比 ≤ 此值 → COOL
+
+# ── 候选筛选参数（candidate_screener.ScreenerParams）──
+screener:
+  min_20d_amplitude: 0.035          # 20日平均振幅 ≥ 3.5%
+  min_20d_amount: 1.0e8             # 20日日均成交额 ≥ 1亿元
+  min_capture_spread: 0.006         # 单笔预期捕获空间 ≥ 0.6%
+
+# ── 回测参数（backtest_t_strategy.BacktestParams）──
+backtest:
+  commission_rate: 0.00025          # 佣金费率（万2.5）
+  stamp_tax_rate: 0.0005            # 印花税（0.05%，卖出单边）
+  slippage: 0.001                   # 滑点（0.1%）

@@ -1,0 +1,38 @@
+{
+  "600000.SH": {
+    "base_shares": 3000,
+    "avg_cost": 10.50,
+    "entry_date": "2026-07-10",
+    "sector_tag": "银行",
+    "t_eligible": true,
+    "today_t_state": {
+      "locked_shares": 0,
+      "t_trades_today": 0,
+      "net_position_delta": 0
+    }
+  },
+  "000001.SZ": {
+    "base_shares": 5000,
+    "avg_cost": 12.30,
+    "entry_date": "2026-07-08",
+    "sector_tag": "银行",
+    "t_eligible": true,
+    "today_t_state": {
+      "locked_shares": 0,
+      "t_trades_today": 0,
+      "net_position_delta": 0
+    }
+  },
+  "300750.SZ": {
+    "base_shares": 200,
+    "avg_cost": 185.00,
+    "entry_date": "2026-07-12",
+    "sector_tag": "宁德时代概念",
+    "t_eligible": true,
+    "today_t_state": {
+      "locked_shares": 0,
+      "t_trades_today": 0,
+      "net_position_delta": 0
+    }
+  }
+}
