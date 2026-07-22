@@ -74,6 +74,10 @@ class BacktestParams:
     warmup_bars: int = 30                   # 预热K线数（前30根不产生信号）
     eod_check_bar_idx: int = 200            # 14:50 对应的K线索引（约第200根）
 
+    # 信号约束（防止同方向连发、强制配对闭环）
+    cooldown_bars: int = 3                  # 信号触发后N根K线内不再触发同方向信号
+    require_opposite_direction: bool = True  # 有未配对腿时只允许反方向信号
+
 
 # ═══════════════════════════════════════════════════════════════
 # 回测状态（单只股票单日）
@@ -90,6 +94,8 @@ class BacktestState:
     total_cost_paid: float = 0.0            # 累计交易成本（元）
     trades: list[dict] = field(default_factory=list)  # 成交记录
     open_legs: list[dict] = field(default_factory=list)  # P1-3: FIFO 待配对的腿
+    last_signal_bar: int = -1               # 上次信号触发的K线索引（冷却期用）
+    last_signal_dir: str = ""               # 上次信号方向 "buy"/"sell"
 
     @property
     def sellable_shares(self) -> int:
@@ -135,7 +141,7 @@ def backtest_single_day(
     trading_date: str,
     bars: list[dict],
     prev_close: float,
-    params: BacktestParams = BacktestParams(),
+    params: Optional[BacktestParams] = None,
     l1_systemic_risk: bool = False,
     theme_retreated: bool = False,
 ) -> dict:
@@ -165,6 +171,7 @@ def backtest_single_day(
         "eod_status": str,             # 尾盘状态
     }
     """
+    params = params or BacktestParams()
     state = BacktestState(
         base_shares=params.base_shares,
         avg_cost=params.avg_cost,
@@ -233,19 +240,43 @@ def backtest_single_day(
             params=params.signal_params,
         )
 
+        # 信号触发判断
+        reduce_ok = reduce_sig.triggered and not is_limit_up_locked
+        add_ok = add_sig.triggered and not is_limit_down_locked
+
+        # 约束1: cooldown_bars — 同方向信号在冷却期内不重复触发
+        if (params.cooldown_bars > 0 and state.last_signal_bar >= 0
+                and (i - state.last_signal_bar) < params.cooldown_bars):
+            if state.last_signal_dir == "sell":
+                reduce_ok = False
+            elif state.last_signal_dir == "buy":
+                add_ok = False
+
+        # 约束2: require_opposite_direction — 有未配对腿时只允许反方向
+        if params.require_opposite_direction and state.open_legs:
+            required_dir = "sell" if state.open_legs[0]["direction"] == "buy" else "buy"
+            if required_dir == "sell":
+                add_ok = False
+            else:
+                reduce_ok = False
+
         # 信号触发后执行（模拟成交）
         # 注意：一个时刻只执行一个方向（避免自相矛盾）
         # 优先级：减仓 > 加仓（保守）
-        if reduce_sig.triggered and not is_limit_up_locked:
+        if reduce_ok:
             _try_execute(
                 code, trading_date, bar, "sell", reduce_sig, state, params,
                 l1_systemic_risk, theme_retreated, prev_close,
             )
-        elif add_sig.triggered and not is_limit_down_locked:
+            state.last_signal_bar = i
+            state.last_signal_dir = "sell"
+        elif add_ok:
             _try_execute(
                 code, trading_date, bar, "buy", add_sig, state, params,
                 l1_systemic_risk, theme_retreated, prev_close,
             )
+            state.last_signal_bar = i
+            state.last_signal_dir = "buy"
 
         # 尾盘平衡检查（约 14:50）— 当前仅通过 eod_status 标记，不平仓
         # P1-5: 删除了空的 _eod_balance 调用，eod_status 在返回值中由 net_position_delta 计算
@@ -398,7 +429,7 @@ def backtest_multi_day(
     code: str,
     daily_bars: dict[str, list[dict]],  # {date: [bars]}
     daily_prev_closes: dict[str, float],  # {date: prev_close}
-    params: BacktestParams = BacktestParams(),
+    params: Optional[BacktestParams] = None,
     l1_risk_dates: set[str] | None = None,
     retreated_dates: set[str] | None = None,
 ) -> dict:
@@ -421,6 +452,7 @@ def backtest_multi_day(
         "daily_results": list[dict],
     }
     """
+    params = params or BacktestParams()
     l1_risk_dates = l1_risk_dates or set()
     retreated_dates = retreated_dates or set()
 

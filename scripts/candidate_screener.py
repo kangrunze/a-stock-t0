@@ -17,22 +17,10 @@ T-eligible 候选筛选器
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
-WESTOCK_NODE = os.environ.get(
-    "WESTOCK_NODE",
-    str(Path.home() / ".workbuddy/binaries/node/versions/22.22.2/node.exe"),
-)
-WESTOCK_DIR = os.environ.get(
-    "WESTOCK_DIR",
-    "D:/Users/kangrunze/AppData/Local/Programs/WorkBuddy/resources/app.asar.unpacked/resources/builtin-skills/westock-data",
-)
-WESTOCK_SCRIPT = os.path.join(WESTOCK_DIR, "scripts", "index.js")
+from westock_client import run_westock, to_westock_symbol
 
 
 @dataclass
@@ -58,50 +46,18 @@ class ScreenResult:
     expected_capture: Optional[float] = None     # 预期捕获空间
 
 
-def _to_westock_symbol(code: str) -> str:
-    if code.startswith(("sh", "sz", "bj")):
-        return code
-    if len(code) == 6 and code[0] == "6":
-        return f"sh{code}"
-    if len(code) == 6 and code[0] in {"0", "2", "3"}:
-        return f"sz{code}"
-    if len(code) == 6 and code[0] in {"4", "8"}:
-        return f"bj{code}"
-    return code
-
-
-def _run_westock(cmd: str, timeout: int = 45) -> Optional[object]:
-    """调用 westock CLI，返回解析后的 JSON。"""
-    import json
-    env = os.environ.copy()
-    env["NODE_PATH"] = os.path.join(WESTOCK_DIR, "node_modules")
-    env["PYTHONIOENCODING"] = "utf-8"
-    full_cmd = [WESTOCK_NODE, WESTOCK_SCRIPT] + cmd.split() + ["--raw"]
-    try:
-        result = subprocess.run(
-            full_cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout, env=env,
-        )
-        stdout = (result.stdout or "").strip()
-        if not stdout:
-            return None
-        return json.loads(stdout)
-    except Exception as e:
-        print(f"[WARN] candidate_screener westock call failed: {e}", file=sys.stderr)
-        return None
-
-
-def screen_candidate(code: str, params: ScreenerParams = DEFAULT_SCREENER_PARAMS) -> ScreenResult:
+def screen_candidate(code: str, params: Optional[ScreenerParams] = None) -> ScreenResult:
     """
     对单只股票进行 T-eligible 筛选。
 
     返回 ScreenResult。任何数据源失败时对应检查项跳过（不阻塞其他项）。
     """
-    symbol = _to_westock_symbol(code)
+    params = params or DEFAULT_SCREENER_PARAMS
+    symbol = to_westock_symbol(code)
     result = ScreenResult(code=code, eligible=False, reasons=[])
 
     # ── 检查 1+2: 20日振幅 + 日均成交额（从日 K 线获取）──
-    kline_data = _run_westock(f"kline {symbol} --period daily --count 20")
+    kline_data = run_westock(f"kline {symbol} --period daily --count 20")
     if isinstance(kline_data, list) and len(kline_data) >= 20:
         amplitudes = []
         amounts = []
@@ -129,7 +85,7 @@ def screen_candidate(code: str, params: ScreenerParams = DEFAULT_SCREENER_PARAMS
         result.reasons.append("日K线数据不足，跳过振幅/成交额检查 ⚠")
 
     # ── 检查 3: 当日非一字板（从 quote 获取）──
-    quote_data = _run_westock(f"quote {symbol}")
+    quote_data = run_westock(f"quote {symbol}")
     if isinstance(quote_data, list) and quote_data:
         q = quote_data[0]
         open_price = float(q.get("open", 0))

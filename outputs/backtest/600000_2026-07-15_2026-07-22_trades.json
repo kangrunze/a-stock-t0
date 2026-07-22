@@ -1,0 +1,150 @@
+[
+  {
+    "date": "2026-07-15",
+    "time": "2026-07-15 10:45:00",
+    "direction": "buy",
+    "shares": 1500,
+    "signal_price": 8.77541153,
+    "fill_price": 8.784186941529999,
+    "cost": 3.2940701030737496,
+    "pnl": 0.0,
+    "paired": false,
+    "rules_score": 3,
+    "rules_fired": [
+      "[项1] VWAP偏离 -4.26% ≤ -0.35%",
+      "[项3] 连续缩量且不再创新低（地量企稳）",
+      "[项4] 板块未退潮且未跌停封板（可成交）"
+    ],
+    "vwap": 9.16622876801734,
+    "expected_spread": 0.04263664456869923,
+    "source": "baostock",
+    "frequency": "5min"
+  },
+  {
+    "date": "2026-07-15",
+    "time": "2026-07-15 13:05:00",
+    "direction": "sell",
+    "shares": 1500,
+    "signal_price": 8.83270475,
+    "fill_price": 8.823872045249999,
+    "cost": 9.92685605090625,
+    "pnl": 59.52765558000017,
+    "paired": true,
+    "rules_score": 3,
+    "rules_fired": [
+      "[项2] RSI=76.2 > 70.0",
+      "[项3] MFI=81.9 > 80.0（资金超买）",
+      "[项4] 未涨停封板（可成交）"
+    ],
+    "vwap": 9.183657093110227,
+    "expected_spread": 0.038214878838792835,
+    "source": "baostock",
+    "frequency": "5min"
+  },
+  {
+    "date": "2026-07-15",
+    "time": "2026-07-15 13:15:00",
+    "direction": "buy",
+    "shares": 1500,
+    "signal_price": 8.83270475,
+    "fill_price": 8.841537454749998,
+    "cost": 3.3155765455312496,
+    "pnl": 0.0,
+    "paired": false,
+    "rules_score": 3,
+    "rules_fired": [
+      "[项1] VWAP偏离 -3.87% ≤ -0.25%",
+      "[项3] 连续缩量且不再创新低（地量企稳）",
+      "[项4] 板块未退潮且未跌停封板（可成交）"
+    ],
+    "vwap": 9.188384279583417,
+    "expected_spread": 0.03870969245090642,
+    "source": "baostock",
+    "frequency": "5min"
+  },
+  {
+    "date": "2026-07-17",
+    "time": "2026-07-17 11:00:00",
+    "direction": "buy",
+    "shares": 1500,
+    "signal_price": 8.82,
+    "fill_price": 8.828819999999999,
+    "cost": 3.3108074999999997,
+    "pnl": 0.0,
+    "paired": false,
+    "rules_score": 3,
+    "rules_fired": [
+      "[项1] VWAP偏离 -0.93% ≤ -0.26%",
+      "[项2] RSI=28.6 < 30.0",
+      "[项4] 板块未退潮且未跌停封板（可成交）"
+    ],
+    "vwap": 8.90237688374603,
+    "expected_spread": 0.009253358380775034,
+    "source": "baostock",
+    "frequency": "5min"
+  },
+  {
+    "date": "2026-07-20",
+    "time": "2026-07-20 10:45:00",
+    "direction": "sell",
+    "shares": 1500,
+    "signal_price": 9.08,
+    "fill_price": 9.07092,
+    "cost": 10.204785,
+    "pnl": 0.0,
+    "paired": false,
+    "rules_score": 4,
+    "rules_fired": [
+      "[项1] VWAP偏离 +1.25% ≥ +0.8×ATR(0.31%)",
+      "[项2] KDJ.K=92.7 > 80.0",
+      "[项3] MFI=88.5 > 80.0（资金超买）",
+      "[项4] 未涨停封板（可成交）"
+    ],
+    "vwap": 8.968046876857086,
+    "expected_spread": 0.01248355686362659,
+    "source": "baostock",
+    "frequency": "5min"
+  },
+  {
+    "date": "2026-07-21",
+    "time": "2026-07-21 11:00:00",
+    "direction": "buy",
+    "shares": 1500,
+    "signal_price": 9.02,
+    "fill_price": 9.02902,
+    "cost": 3.3858824999999997,
+    "pnl": 0.0,
+    "paired": false,
+    "rules_score": 3,
+    "rules_fired": [
+      "[项1] VWAP偏离 -1.10% ≤ -0.40%",
+      "[项2] KDJ.K=10.4 < 20.0",
+      "[项4] 板块未退潮且未跌停封板（可成交）"
+    ],
+    "vwap": 9.120363028360776,
+    "expected_spread": 0.011004279988492419,
+    "source": "baostock",
+    "frequency": "5min"
+  },
+  {
+    "date": "2026-07-22",
+    "time": "2026-07-22 11:00:00",
+    "direction": "sell",
+    "shares": 1500,
+    "signal_price": 8.92,
+    "fill_price": 8.91108,
+    "cost": 10.024965000000002,
+    "pnl": 0.0,
+    "paired": false,
+    "rules_score": 3,
+    "rules_fired": [
+      "[项1] VWAP偏离 +0.84% ≥ +0.8×ATR(0.36%)",
+      "[项2] KDJ.K=82.7 > 80.0",
+      "[项4] 未涨停封板（可成交）"
+    ],
+    "vwap": 8.845660297418766,
+    "expected_spread": 0.008404087437421394,
+    "source": "baostock",
+    "frequency": "5min"
+  }
+]

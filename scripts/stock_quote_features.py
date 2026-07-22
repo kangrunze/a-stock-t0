@@ -25,68 +25,9 @@ westock quote 已返回的字段（实测 sh600000）:
 
 from __future__ import annotations
 
-import os
-import subprocess
-import sys
-from pathlib import Path
 from typing import Optional
 
-# ═══════════════════════════════════════════════════════════════
-# westock CLI（与 minute_bar_fetcher / market_layer 一致）
-# ═══════════════════════════════════════════════════════════════
-WESTOCK_NODE = os.environ.get(
-    "WESTOCK_NODE",
-    str(Path.home() / ".workbuddy/binaries/node/versions/22.22.2/node.exe"),
-)
-WESTOCK_DIR = os.environ.get(
-    "WESTOCK_DIR",
-    "D:/Users/kangrunze/AppData/Local/Programs/WorkBuddy/resources/app.asar.unpacked/resources/builtin-skills/westock-data",
-)
-WESTOCK_SCRIPT = os.path.join(WESTOCK_DIR, "scripts", "index.js")
-
-
-def _to_westock_symbol(code: str) -> str:
-    """6 位代码 → sh/sz/bj 前缀。"""
-    if code.startswith(("sh", "sz", "bj", "pt")):
-        return code
-    if len(code) == 6 and code[0] == "6":
-        return f"sh{code}"
-    if len(code) == 6 and code[0] in {"0", "2", "3"}:
-        return f"sz{code}"
-    if len(code) == 6 and code[0] in {"4", "8"}:
-        return f"bj{code}"
-    return code
-
-
-def _run_westock_quote(symbol: str) -> Optional[dict]:
-    """调用 westock quote，返回原始 item dict。"""
-    import json
-    env = os.environ.copy()
-    env["NODE_PATH"] = os.path.join(WESTOCK_DIR, "node_modules")
-    env["PYTHONIOENCODING"] = "utf-8"
-    full_cmd = [WESTOCK_NODE, WESTOCK_SCRIPT, "quote", symbol, "--raw"]
-    try:
-        result = subprocess.run(
-            full_cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=45,
-            env=env,
-        )
-        stdout = (result.stdout or "").strip()
-        if not stdout:
-            return None
-        data = json.loads(stdout)
-        if isinstance(data, list) and data:
-            return data[0]
-        if isinstance(data, dict):
-            return data
-        return None
-    except Exception as e:
-        print(f"[WARN] stock_quote_features westock quote failed: {e}", file=sys.stderr)
-        return None
+from westock_client import run_westock, to_westock_symbol
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -98,8 +39,14 @@ def fetch_quote_features(code: str) -> dict:
 
     所有数值字段失败时为 None，不抛异常。
     """
-    symbol = _to_westock_symbol(code)
-    item = _run_westock_quote(symbol)
+    symbol = to_westock_symbol(code)
+    raw = run_westock(f"quote {symbol}")
+    if isinstance(raw, list) and raw:
+        item = raw[0]
+    elif isinstance(raw, dict):
+        item = raw
+    else:
+        item = None
     if not item:
         return {}
 

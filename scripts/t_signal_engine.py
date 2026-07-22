@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from intraday_reference import compute_reference_snapshot
+from stock_quote_features import merge_with_reference_snapshot
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -80,7 +81,7 @@ class SignalParams:
     active_buy_pressure: float = 0.55       # 主动买占比 > 此值视为买盘（加仓辅助）
 
     # 触发阈值
-    min_rules_to_trigger: int = 3           # 6 项中至少 3 项满足
+    min_rules_to_trigger: int = 3           # 4 项中至少 3 项满足（3 内容项 + 1 过滤项）
 
 
 DEFAULT_PARAMS = SignalParams()
@@ -161,7 +162,7 @@ def evaluate_reduce_signal(
     current_price: Optional[float] = None,
     prev_close: Optional[float] = None,
     is_limit_up_locked: bool = False,
-    params: SignalParams = DEFAULT_PARAMS,
+    params: Optional[SignalParams] = None,
     quote_feats: Optional[dict] = None,
 ) -> TSignal:
     """
@@ -176,8 +177,7 @@ def evaluate_reduce_signal(
 
     盘口特征辅助：MFI>80 或 主动卖占比>0.55 可作为项3的替代量能信号。
     """
-    from stock_quote_features import merge_with_reference_snapshot
-
+    params = params or DEFAULT_PARAMS
     snap = compute_reference_snapshot(bars, current_price, prev_close)
     if not snap:
         return TSignal(direction="reduce")
@@ -273,7 +273,7 @@ def evaluate_add_signal(
     prev_close: Optional[float] = None,
     is_limit_down_locked: bool = False,
     theme_retreated: bool = False,
-    params: SignalParams = DEFAULT_PARAMS,
+    params: Optional[SignalParams] = None,
     quote_feats: Optional[dict] = None,
 ) -> TSignal:
     """
@@ -288,8 +288,7 @@ def evaluate_add_signal(
 
     盘口特征辅助：MFI<20 或 主动买占比>0.55 可作为项3的替代量能信号。
     """
-    from stock_quote_features import merge_with_reference_snapshot
-
+    params = params or DEFAULT_PARAMS
     snap = compute_reference_snapshot(bars, current_price, prev_close)
     if not snap:
         return TSignal(direction="add")
@@ -417,7 +416,7 @@ def evaluate_all_signals(
     is_limit_up_locked: bool = False,
     is_limit_down_locked: bool = False,
     theme_retreated: bool = False,
-    params: SignalParams = DEFAULT_PARAMS,
+    params: Optional[SignalParams] = None,
     market=None,
     quote_feats: Optional[dict] = None,
 ) -> dict:
@@ -439,6 +438,7 @@ def evaluate_all_signals(
         "market_gate_reduce": dict,# 减仓门控结果
     }
     """
+    params = params or DEFAULT_PARAMS
     reduce_sig = evaluate_reduce_signal(
         bars, current_price, prev_close, is_limit_up_locked, params, quote_feats
     )

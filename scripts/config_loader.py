@@ -19,6 +19,11 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from t_signal_engine import SignalParams, DEFAULT_PARAMS
+from t_risk_guard import RiskParams, DEFAULT_RISK_PARAMS
+from backtest_t_strategy import BacktestParams
+from candidate_screener import ScreenerParams
+
 CONFIG_FILE = Path(__file__).resolve().parent.parent / "config" / "thresholds.yaml"
 
 
@@ -40,7 +45,6 @@ def _load_yaml() -> Optional[dict]:
 
 def load_signal_params():
     """从 yaml 加载 SignalParams，yaml 不存在时返回默认值。"""
-    from t_signal_engine import SignalParams, DEFAULT_PARAMS
     data = _load_yaml()
     if not data or "signal" not in data:
         return DEFAULT_PARAMS
@@ -54,7 +58,6 @@ def load_signal_params():
 
 def load_risk_params():
     """从 yaml 加载 RiskParams，yaml 不存在时返回默认值。"""
-    from t_risk_guard import RiskParams, DEFAULT_RISK_PARAMS
     data = _load_yaml()
     if not data or "risk" not in data:
         return DEFAULT_RISK_PARAMS
@@ -68,7 +71,6 @@ def load_risk_params():
 
 def load_backtest_params():
     """从 yaml 加载 BacktestParams，yaml 不存在时返回默认值。"""
-    from backtest_t_strategy import BacktestParams
     data = _load_yaml()
     if not data or "backtest" not in data:
         return BacktestParams()
@@ -83,7 +85,6 @@ def load_backtest_params():
 
 def load_screener_params():
     """从 yaml 加载 ScreenerParams，yaml 不存在时返回默认值。"""
-    from candidate_screener import ScreenerParams
     data = _load_yaml()
     if not data or "screener" not in data:
         return ScreenerParams()

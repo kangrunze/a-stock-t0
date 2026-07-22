@@ -17,71 +17,12 @@
 
 from __future__ import annotations
 
-import json
-import os
-import subprocess
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
-# ═══════════════════════════════════════════════════════════════
-# 路径配置
-# ═══════════════════════════════════════════════════════════════
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-
-# ashare-sop-engine 题材快照（软依赖，不存在则忽略）
-# 同机运行时可指向 d:/project/ashare-sop-engine/hermes/data/themes_v17.json
-THEMES_V17_FILE = Path(os.environ.get(
-    "A_T0_THEMES_V17",
-    str(PROJECT_ROOT / "data" / "themes_v17.json"),
-))
-
-# westock CLI（与 minute_bar_fetcher 一致）
-WESTOCK_NODE = os.environ.get(
-    "WESTOCK_NODE",
-    str(Path.home() / ".workbuddy/binaries/node/versions/22.22.2/node.exe"),
-)
-WESTOCK_DIR = os.environ.get(
-    "WESTOCK_DIR",
-    "D:/Users/kangrunze/AppData/Local/Programs/WorkBuddy/resources/app.asar.unpacked/resources/builtin-skills/westock-data",
-)
-WESTOCK_SCRIPT = os.path.join(WESTOCK_DIR, "scripts", "index.js")
-
-
-# ═══════════════════════════════════════════════════════════════
-# westock 调用（通用版，返回原始 JSON）
-# ═══════════════════════════════════════════════════════════════
-def _run_westock_raw(cmd: str, timeout: int = 45) -> Optional[object]:
-    """
-    调用 westock-data CLI，返回原始解析后的 JSON（dict / list / None）。
-
-    与 minute_bar_fetcher._run_westock 不同：后者针对 kline/quote 的 list 结构
-    做了扁平化；本函数保留原始结构，以适配 changedist（单 dict）和
-    sector ranking（嵌套 dict）的返回。
-    """
-    env = os.environ.copy()
-    env["NODE_PATH"] = os.path.join(WESTOCK_DIR, "node_modules")
-    env["PYTHONIOENCODING"] = "utf-8"
-    full_cmd = [WESTOCK_NODE, WESTOCK_SCRIPT] + cmd.split() + ["--raw"]
-    try:
-        result = subprocess.run(
-            full_cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=env,
-        )
-        stdout = (result.stdout or "").strip()
-        if not stdout:
-            return None
-        return json.loads(stdout)
-    except Exception as e:
-        print(f"[WARN] market_layer westock call failed: {e}", file=sys.stderr)
-        return None
+from westock_client import run_westock
+from l2_theme_reader import get_themes_snapshot
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -151,7 +92,7 @@ def fetch_limit_board_snapshot() -> dict:
 
     返回 dict（字段与 MarketSnapshot 涨跌停部分对应）。失败返回空 dict。
     """
-    data = _run_westock_raw("changedist")
+    data = run_westock("changedist")
     if not isinstance(data, dict):
         return {}
     return {
@@ -175,7 +116,7 @@ def fetch_sector_ranking_snapshot() -> dict:
       - top_inflow_sectors: 主力资金流入榜（list[dict]）
     失败返回空 dict。
     """
-    data = _run_westock_raw("sector ranking")
+    data = run_westock("sector ranking")
     if not isinstance(data, dict):
         return {}
     sections = data.get("sections", [])
@@ -215,7 +156,6 @@ def read_themes_v17() -> Optional[dict]:
 
     文件不存在时返回 None（a-t0 独立运行，不报错）。
     """
-    from l2_theme_reader import get_themes_snapshot
     return get_themes_snapshot()
 
 

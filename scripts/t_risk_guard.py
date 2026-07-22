@@ -34,13 +34,14 @@ from position_tracker import (
     get_net_position_delta,
     load_positions,
 )
+from l2_theme_reader import get_theme_state
 
 # ═══════════════════════════════════════════════════════════════
 # 路径配置（L1/L2 软联动）
 # ═══════════════════════════════════════════════════════════════
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 L1_GATE_FILE = PROJECT_ROOT / "data" / "l1_gate.json"
-L2_THEME_DIR = PROJECT_ROOT / "outputs"  # L2 题材状态输出目录
+# P1-2: L2 题材文件发现已统一收敛到 l2_theme_reader.py
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -112,7 +113,6 @@ def read_theme_state(theme_name: Optional[str]) -> str:
 
     独立性保证：L2 不存在不影响 L5 运行。
     """
-    from l2_theme_reader import get_theme_state
     return get_theme_state(theme_name)
 
 
@@ -131,7 +131,7 @@ def check_risk(
     requested_shares: int,
     signal_price: float,
     reference_price: float,
-    params: RiskParams = DEFAULT_RISK_PARAMS,
+    params: Optional[RiskParams] = None,
     positions_path: Path = POSITIONS_FILE,
 ) -> RiskCheckResult:
     """
@@ -148,6 +148,7 @@ def check_risk(
 
     返回: RiskCheckResult
     """
+    params = params or DEFAULT_RISK_PARAMS
     if direction not in {"buy", "sell"}:
         return RiskCheckResult(approved=False, reason=f"invalid direction: {direction}")
     if requested_shares <= 0:

@@ -20,13 +20,11 @@ L5 分钟K线获取器
 from __future__ import annotations
 
 import csv
-import json
-import os
-import subprocess
-import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+from westock_client import run_westock, to_westock_symbol
 
 # ═══════════════════════════════════════════════════════════════
 # 路径配置
@@ -34,34 +32,10 @@ from typing import Optional
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MINUTE_DATA_DIR = PROJECT_ROOT / "data" / "minute_bars"
 
-# westock-data CLI（与 L3 一致）
-WESTOCK_NODE = os.environ.get(
-    "WESTOCK_NODE",
-    str(Path.home() / ".workbuddy/binaries/node/versions/22.22.2/node.exe"),
-)
-WESTOCK_DIR = os.environ.get(
-    "WESTOCK_DIR",
-    "D:/Users/kangrunze/AppData/Local/Programs/WorkBuddy/resources/app.asar.unpacked/resources/builtin-skills/westock-data",
-)
-WESTOCK_SCRIPT = os.path.join(WESTOCK_DIR, "scripts", "index.js")
-
 
 # ═══════════════════════════════════════════════════════════════
 # 代码格式转换
 # ═══════════════════════════════════════════════════════════════
-def to_westock_symbol(code: str) -> str:
-    """将 6 位 A 股代码转换为 westock 所需的 sh/sz 前缀格式。"""
-    if code.startswith(("sh", "sz", "bj", "pt")):
-        return code
-    if len(code) == 6 and code[0] == "6":
-        return f"sh{code}"
-    if len(code) == 6 and code[0] in {"0", "2", "3"}:
-        return f"sz{code}"
-    if len(code) == 6 and code[0] in {"4", "8"}:
-        return f"bj{code}"
-    return code
-
-
 def strip_market_prefix(code: str) -> str:
     """将 sh/sz/bj 前缀代码映射回 6 位代码。"""
     if code.startswith(("sh", "sz", "bj")) and len(code) == 8:
@@ -70,44 +44,24 @@ def strip_market_prefix(code: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# westock-data CLI 调用
+# westock-data CLI 调用（list 展平封装）
 # ═══════════════════════════════════════════════════════════════
 def _run_westock(cmd: str) -> list[dict]:
-    """调用 westock-data CLI 并以 JSON 解析返回。"""
-    env = os.environ.copy()
-    env["NODE_PATH"] = os.path.join(WESTOCK_DIR, "node_modules")
-    env["PYTHONIOENCODING"] = "utf-8"
-    full_cmd = [WESTOCK_NODE, WESTOCK_SCRIPT] + cmd.split() + ["--raw"]
-    try:
-        result = subprocess.run(
-            full_cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=45,
-            env=env,
-        )
-        stdout = (result.stdout or "").strip()
-        if not stdout:
-            return []
-        data = json.loads(stdout)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "data" in data:
-            items = data["data"]
-            if isinstance(items, list):
-                flat = []
-                for item in items:
-                    if isinstance(item, dict) and "data" in item:
-                        flat.append(item["data"])
-                    else:
-                        flat.append(item)
-                return flat
-        return []
-    except Exception as e:
-        print(f"[WARN] westock-data call failed: {e}", file=sys.stderr)
-        return []
+    """调用 westock CLI 并将返回展平为 list[dict]（适配 kline 的嵌套结构）。"""
+    data = run_westock(cmd)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and "data" in data:
+        items = data["data"]
+        if isinstance(items, list):
+            flat = []
+            for item in items:
+                if isinstance(item, dict) and "data" in item:
+                    flat.append(item["data"])
+                else:
+                    flat.append(item)
+            return flat
+    return []
 
 
 def fetch_realtime_minute_bars(code: str, limit: int = 240) -> list[dict]:
