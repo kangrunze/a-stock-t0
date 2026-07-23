@@ -1,0 +1,12 @@
+{
+  "market_risk_state": "NEUTRAL",
+  "is_tradable": true,
+  "up_limit_count": null,
+  "down_limit_count": null,
+  "up_ratio": null,
+  "total_amount": null,
+  "top_industries": [],
+  "top_concepts": [],
+  "futures_basis": null,
+  "timestamp": "2026-07-23T11:09:50"
+}

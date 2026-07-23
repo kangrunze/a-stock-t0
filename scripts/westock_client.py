@@ -34,6 +34,9 @@ WESTOCK_NODE = os.environ.get(
 # westock-data 目录：P2-2 — 不再硬编码个人机器路径，必须通过环境变量配置
 WESTOCK_DIR = os.environ.get("WESTOCK_DIR", "")
 
+# 未配置警告只打印一次，避免多只股票刷屏
+_warned_not_configured = False
+
 
 def _check_configured() -> None:
     """检查 WESTOCK_DIR 是否已配置。未配置时抛出 RuntimeError（懒检查，不影响 import）。"""
@@ -74,8 +77,16 @@ def run_westock(cmd: str, timeout: int = 45) -> Optional[object]:
       timeout: 超时秒数
 
     返回: 解析后的 JSON 对象；空输出或异常时返回 None。
+          WESTOCK_DIR 未配置时返回 None（打印警告，不抛异常，让调用方降级）。
     """
-    _check_configured()
+    try:
+        _check_configured()
+    except RuntimeError as e:
+        global _warned_not_configured
+        if not _warned_not_configured:
+            print(f"[WARN] {e}", file=sys.stderr)
+            _warned_not_configured = True
+        return None
     westock_script = os.path.join(WESTOCK_DIR, "scripts", "index.js")
     env = os.environ.copy()
     env["NODE_PATH"] = os.path.join(WESTOCK_DIR, "node_modules")

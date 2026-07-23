@@ -31,9 +31,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from position_tracker import load_positions, get_position, get_sellable_shares
 from minute_bar_fetcher import (
-    get_minute_bars, check_bar_freshness,
+    fetch_realtime_quote, check_bar_freshness,
     is_one_word_board, is_limit_up_locked, is_limit_down_locked,
 )
+from data_provider import fetch_minute_bars
 from t_signal_engine import evaluate_all_signals, SignalParams
 from t_risk_guard import (
     check_risk, is_l1_systemic_risk, is_theme_retreated,
@@ -97,6 +98,31 @@ def _save_market_gate_json(market: MarketSnapshot) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 合成报价（非 westock 数据源兜底）
+# ═══════════════════════════════════════════════════════════════
+def _build_synthetic_quote(bars: list[dict], prev_close: float) -> dict:
+    """
+    用 bars + prev_close 构造合成报价 dict（baostock/mootdx 无实时 quote 时兜底）。
+
+    与 westock_client.fetch_realtime_quote 的字段口径一致：
+      涨停 = prev_close × 1.1，跌停 = prev_close × 0.9（四舍五入到分）。
+    """
+    last = bars[-1] if bars else {}
+    return {
+        "code": "",
+        "price": float(last.get("close", 0)),
+        "prev_close": float(prev_close),
+        "open": float(bars[0]["open"]) if bars else 0,
+        "high": max(float(b["high"]) for b in bars) if bars else 0,
+        "low": min(float(b["low"]) for b in bars) if bars else 0,
+        "volume": sum(int(b["volume"]) for b in bars) if bars else 0,
+        "amount": sum(float(b["amount"]) for b in bars) if bars else 0,
+        "limit_up": round(float(prev_close) * 1.1, 2) if prev_close else 0,
+        "limit_down": round(float(prev_close) * 0.9, 2) if prev_close else 0,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
 # 单只股票监控
 # ═══════════════════════════════════════════════════════════════
 def monitor_single_stock(
@@ -105,6 +131,8 @@ def monitor_single_stock(
     market: MarketSnapshot = None,
     signal_params: SignalParams = None,
     risk_params: RiskParams = None,
+    source: str = "auto",
+    trading_date: str = None,
 ) -> dict:
     """
     对单只持仓股票进行 T 信号监控。
@@ -113,11 +141,16 @@ def monitor_single_stock(
       market: 市场层快照（可选），COLD 市场禁加仓。由 main() 每轮统一计算后传入。
       signal_params: 信号参数（来自 config_loader.load_signal_params()）
       risk_params: 风控参数（来自 config_loader.load_risk_params()）
+      source: 数据源 'auto'|'mootdx'|'westock'|'baostock'（统一走 data_provider）
+      trading_date: 'YYYY-MM-DD'，None=实时（今日），指定日期=历史回放
 
     返回监控结果 dict。
     """
     signal_params = signal_params or SignalParams()
     risk_params = risk_params or RiskParams()
+    today = datetime.now().strftime("%Y-%m-%d")
+    trading_date = trading_date or today
+    is_realtime = trading_date == today
     result = {
         "code": code,
         "theme": pos.get("sector_tag", ""),  # 输出键名保留 theme 便于展示
@@ -133,22 +166,28 @@ def monitor_single_stock(
         result["reason"] = "t_eligible=false"
         return result
 
-    # 获取数据
-    bars, quote = get_minute_bars(code)
+    # 获取数据（统一走 data_provider，支持 mootdx/westock/baostock）
+    bars, prev_close, meta = fetch_minute_bars(code, trading_date, source)
     if not bars or len(bars) < 30:
-        result["reason"] = f"数据不足 ({len(bars)} bars)"
+        result["reason"] = f"数据不足 ({len(bars)} bars, source={meta.get('source')})"
         log_monitor(f"{code}: skip — {result['reason']}")
         return result
 
-    # 数据时效性检查
-    if not check_bar_freshness(bars):
+    # 数据时效性检查（仅实时模式；历史回放不检查）
+    if is_realtime and not check_bar_freshness(bars):
         result["reason"] = "数据陈旧（>2分钟无更新）"
         log_monitor(f"{code}: skip — {result['reason']}")
         return result
 
+    # 报价：实时模式优先 westock 实时报价，失败/历史模式用 prev_close 构造合成报价
+    quote = None
+    if is_realtime and source in ("auto", "westock"):
+        try:
+            quote = fetch_realtime_quote(code)
+        except Exception:
+            quote = None
     if not quote:
-        result["reason"] = "无实时报价"
-        return result
+        quote = _build_synthetic_quote(bars, prev_close)
 
     # 一字板过滤
     if is_one_word_board(quote):
@@ -270,15 +309,25 @@ def monitor_single_stock(
 # ═══════════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════════
-def main() -> int:
-    """主入口。返回 0 (无信号) 或 1 (有信号输出)。"""
-    # 时间窗口
-    if not is_trading_time():
+def main(source: str = "auto", trading_date: str = None) -> int:
+    """
+    主入口。返回 0 (无信号) 或 1 (有信号输出)。
+
+    参数:
+      source: 数据源 'auto'|'mootdx'|'westock'|'baostock'
+      trading_date: None=实时（今日），'YYYY-MM-DD'=历史回放
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    trading_date = trading_date or today
+    is_realtime = trading_date == today
+
+    # 时间窗口（仅实时模式检查；历史回放不受交易时段限制）
+    if is_realtime and not is_trading_time():
         log_monitor("skip non_trading_time")
         return 0
 
-    # 尾盘平衡检查
-    if is_eod_check_time():
+    # 尾盘平衡检查（仅实时模式）
+    if is_realtime and is_eod_check_time():
         eod_results = eod_balance_check_all()
         for eod in eod_results:
             if eod.get("status") in {"net_reduce", "net_add"}:
@@ -298,8 +347,17 @@ def main() -> int:
     risk_params = load_risk_params()
 
     # 市场层快照（跨股票共享，每轮计算一次，落盘 market_gate.json）
-    market = compute_market_snapshot(use_westock=True)
+    # westock 为可选外部数据源：未配置 WESTOCK_DIR 时降级为独立模式
+    # （市场情绪 NEUTRAL，无涨跌停/板块热度数据），与 L1/L2 软依赖处理一致
+    use_westock = bool(os.environ.get("WESTOCK_DIR"))
+    if not use_westock:
+        print("[WARN] WESTOCK_DIR 未设置，市场层降级为独立模式"
+              "（NEUTRAL 情绪，无涨跌停/板块数据）", file=sys.stderr)
+    market = compute_market_snapshot(use_westock=use_westock)
     _save_market_gate_json(market)
+
+    mode_label = f"历史回放 {trading_date}" if not is_realtime else "实时"
+    log_monitor(f"run source={source} mode={mode_label} positions={len(positions)}")
 
     # 逐只监控
     results = []
@@ -308,6 +366,7 @@ def main() -> int:
         r = monitor_single_stock(
             code, pos, market=market,
             signal_params=signal_params, risk_params=risk_params,
+            source=source, trading_date=trading_date,
         )
         results.append(r)
         if r["action"] == "signal":
@@ -345,15 +404,31 @@ def main() -> int:
 # CLI 入口
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    if "--demo" in sys.argv:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="L5 T+0 日内做T监控（多数据源：eastmoney/mootdx/westock/baostock）"
+    )
+    parser.add_argument("--source", default="auto",
+                        choices=["auto", "mootdx", "westock", "baostock", "eastmoney"],
+                        help="数据源：auto=自动回退(默认) | eastmoney(免依赖,实时) | mootdx | westock | baostock(历史)")
+    parser.add_argument("--date", default=None,
+                        help="交易日 YYYY-MM-DD（不传=实时今日，传=历史回放）")
+    parser.add_argument("--demo", action="store_true",
+                        help="测试模式：忽略交易时段限制（实时模式用）")
+    parser.add_argument("--eod-check", action="store_true",
+                        help="仅执行尾盘平衡检查")
+    args = parser.parse_args()
+
+    if args.demo:
         # 测试模式：忽略时间窗口
         globals()["is_trading_time"] = lambda: True
         print("[DEMO] 测试模式 — 忽略时间窗口限制", file=sys.stderr)
 
-    if "--eod-check" in sys.argv:
+    if args.eod_check:
         # 仅执行尾盘平衡检查
         results = eod_balance_check_all()
         print(json.dumps(results, ensure_ascii=False, indent=2))
         sys.exit(0)
 
-    sys.exit(main())
+    sys.exit(main(source=args.source, trading_date=args.date))

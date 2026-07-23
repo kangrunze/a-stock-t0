@@ -41,9 +41,10 @@ from minute_bar_fetcher import fetch_realtime_minute_bars, fetch_realtime_quote
 SRC_MOOTDX = "mootdx"
 SRC_WESTOCK = "westock"
 SRC_BAOSTOCK = "baostock"
+SRC_EASTMONEY = "eastmoney"
 
-# auto 模式回退顺序
-AUTO_FALLBACK = [SRC_MOOTDX, SRC_WESTOCK, SRC_BAOSTOCK]
+# auto 模式回退顺序：eastmoney 优先（免依赖、盘中实时），baostock 兜底（历史多日）
+AUTO_FALLBACK = [SRC_EASTMONEY, SRC_MOOTDX, SRC_WESTOCK, SRC_BAOSTOCK]
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -61,6 +62,7 @@ def normalize_code(code: str) -> dict:
         "baostock": "sh.600000",    # BaoStock 格式
         "westock": "sh600000",      # westock-data 格式
         "mootdx": "600000",         # mootdx 格式（纯代码）
+        "eastmoney": "1.600000",    # 东方财富 secid（沪=1. 深=0.）
         "market": 0,                # mootdx market: 0=沪 1=深
       }
     """
@@ -72,11 +74,14 @@ def normalize_code(code: str) -> dict:
     head = s[0]
     if head == "6":
         market, prefix = 0, "sh"
+        em_market = 1  # 东方财富：沪市 1
     elif head in ("0", "3", "2"):
         market, prefix = 1, "sz"
+        em_market = 0  # 东方财富：深市 0
     elif head in ("4", "8"):
         market, prefix = 1  # 北交所 mootdx 兼容深市通道，BaoStock 用 bj
         prefix = "bj"
+        em_market = 0
     else:
         raise ValueError(f"未知代码前缀: {code}")
 
@@ -85,6 +90,7 @@ def normalize_code(code: str) -> dict:
         "baostock": f"{prefix}.{s}",
         "westock": f"{prefix}{s}",
         "mootdx": s,
+        "eastmoney": f"{em_market}.{s}",
         "market": market,
     }
 
@@ -334,6 +340,125 @@ def _baostock_prev_close(baostock_code: str, trading_date: str) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 东方财富适配器（实时1分钟线 + 日线 prev_close，免第三方依赖）
+# ═══════════════════════════════════════════════════════════════
+_EM_KLINE_URL = "http://push2his.eastmoney.com/api/qt/stock/kline/get"
+
+
+def _fetch_eastmoney(code: str, trading_date: str) -> tuple[list[dict], float]:
+    """
+    东方财富拉取指定交易日 1 分钟线 + 昨收。
+
+    注意：东方财富 klt=1 的 beg/end 参数无效，API 始终返回最近交易日数据。
+    因此历史日期需拉取足够多 K 线（lmt=N×240）再按日期过滤。
+
+    优势：免第三方依赖（仅 requests），支持当日盘中实时，也支持历史多日。
+    返回格式与 baostock/mootdx 一致。
+    """
+    import requests
+    from datetime import datetime, timedelta
+
+    nc = normalize_code(code)
+    secid = nc["eastmoney"]
+    target_date = trading_date  # YYYY-MM-DD
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # 估算需要拉取的 K 线数：每交易日最多 240 根，按天数差计算
+    days_diff = (datetime.now() - datetime.strptime(target_date, "%Y-%m-%d")).days
+    n_days = max(1, days_diff + 1)  # 至少 1 天
+    lmt = min(n_days * 240, 5000)  # 上限 5000 根避免响应过大
+
+    # 1. 拉 1 分钟线（klt=1），lmt 控制根数
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "klt": "1",       # 1=1分钟
+        "fqt": "1",       # 1=前复权
+        "beg": "19900101",  # 东方财富忽略此参数，但必须传
+        "end": "20500101",
+        "lmt": str(lmt),
+    }
+    try:
+        r = requests.get(_EM_KLINE_URL, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json().get("data") or {}
+        klines = data.get("klines") or []
+    except Exception as e:
+        print(f"[data_provider] eastmoney 拉取失败: {e}")
+        return [], 0.0
+
+    # 2. 按目标日期过滤
+    bars: list[dict] = []
+    for line in klines:
+        # 格式: "2026-07-23 10:52,9.01,9.00,9.01,8.99,3161,2845908.00,0.22"
+        parts = line.split(",")
+        if len(parts) < 7:
+            continue
+        if not parts[0].startswith(target_date):
+            continue
+        try:
+            bars.append({
+                "time": f"{parts[0]}:00",  # "2026-07-23 10:52" → "2026-07-23 10:52:00"
+                "open": float(parts[1]),
+                "high": float(parts[2]),
+                "low": float(parts[3]),
+                "close": float(parts[4]),
+                "volume": int(float(parts[5]) * 100),  # 东方财富单位"手"→股
+                "amount": float(parts[6]),
+            })
+        except (ValueError, IndexError):
+            continue
+
+    if not bars:
+        return [], 0.0
+
+    # 3. prev_close：拉日线，取 target_date 前一交易日收盘
+    prev_close = _eastmoney_prev_close(secid, target_date)
+    return bars, prev_close
+
+
+def _eastmoney_prev_close(secid: str, trading_date: str) -> float:
+    """东方财富日线取 trading_date 前一交易日收盘（前复权）。"""
+    import requests
+    from datetime import datetime, timedelta
+
+    # 往前推 10 天确保覆盖周末/假日
+    end = datetime.strptime(trading_date, "%Y-%m-%d")
+    beg = end - timedelta(days=10)
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58",
+        "klt": "101",     # 101=日线
+        "fqt": "1",
+        "beg": beg.strftime("%Y%m%d"),
+        "end": end.strftime("%Y%m%d"),
+        "lmt": "10",
+    }
+    try:
+        r = requests.get(_EM_KLINE_URL, params=params, timeout=8)
+        r.raise_for_status()
+        klines = (r.json().get("data") or {}).get("klines") or []
+    except Exception:
+        return 0.0
+
+    # 找 trading_date 之前最近一条的 close
+    prev_close = 0.0
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 5:
+            continue
+        d = parts[0]
+        if d < trading_date:
+            try:
+                prev_close = float(parts[2])  # 日线 close
+            except ValueError:
+                continue
+    return prev_close
+
+
+# ═══════════════════════════════════════════════════════════════
 # 统一入口（auto 回退）
 # ═══════════════════════════════════════════════════════════════
 def fetch_minute_bars(
@@ -346,7 +471,7 @@ def fetch_minute_bars(
 
     :param code: 任意格式代码
     :param trading_date: 'YYYY-MM-DD'
-    :param source: 'auto' | 'mootdx' | 'westock' | 'baostock'
+    :param source: 'auto' | 'mootdx' | 'westock' | 'baostock' | 'eastmoney'
     :return: (bars, prev_close, meta)
         bars: 升序，格式 {time, open, high, low, close, volume, amount}
         meta: {"source": 实际数据源, "frequency": "1min"|"5min",
@@ -366,6 +491,9 @@ def fetch_minute_bars(
             elif src == SRC_BAOSTOCK:
                 bars, pc = _fetch_baostock(code, trading_date)
                 freq = "5min"
+            elif src == SRC_EASTMONEY:
+                bars, pc = _fetch_eastmoney(code, trading_date)
+                freq = "1min"
             else:
                 continue
 
@@ -443,7 +571,7 @@ if __name__ == "__main__":
     parser.add_argument("--start", default=None, help="区间起 YYYY-MM-DD")
     parser.add_argument("--end", default=None, help="区间止 YYYY-MM-DD")
     parser.add_argument("--source", default="auto",
-                        choices=["auto", "mootdx", "westock", "baostock"])
+                        choices=["auto", "mootdx", "westock", "baostock", "eastmoney"])
     args = parser.parse_args()
 
     if args.date:

@@ -1,3 +1,63 @@
 [2026-07-22 15:41:35] skip non_trading_time
 [2026-07-22 15:41:57] skip non_trading_time
 [2026-07-22 15:42:09] no positions
+[2026-07-23 09:48:25] 600xxx.SH: skip — 数据不足 (0 bars)
+[2026-07-23 09:48:25] no_signal positions=1
+[2026-07-23 09:48:55] 600xxx.SH: skip — 数据不足 (0 bars)
+[2026-07-23 09:48:55] no_signal positions=1
+[2026-07-23 09:49:23] 600xxx.SH: skip — 数据不足 (0 bars)
+[2026-07-23 09:49:23] no_signal positions=1
+[2026-07-23 09:50:04] 600xxx.SH: skip — 数据不足 (0 bars)
+[2026-07-23 09:50:04] no_signal positions=1
+[2026-07-23 09:50:14] 600xxx.SH: skip — 数据不足 (0 bars)
+[2026-07-23 09:50:14] no_signal positions=1
+[2026-07-23 09:51:24] 600xxx.SH: skip — 数据不足 (0 bars)
+[2026-07-23 09:51:24] no_signal positions=1
+[2026-07-23 10:06:35] run source=baostock mode=历史回放 2026-07-22 positions=1
+[2026-07-23 10:06:41] no_signal positions=1
+[2026-07-23 10:07:17] run source=auto mode=历史回放 2026-07-22 positions=1
+[2026-07-23 10:08:40] no_signal positions=1
+[2026-07-23 10:34:07] run source=auto mode=实时 positions=1
+[2026-07-23 10:34:07] 600000.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:34:07] no_signal positions=1
+[2026-07-23 10:34:27] run source=baostock mode=实时 positions=1
+[2026-07-23 10:34:27] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:34:27] no_signal positions=1
+[2026-07-23 10:36:04] run source=baostock mode=实时 positions=1
+[2026-07-23 10:36:04] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:36:04] no_signal positions=1
+[2026-07-23 10:43:08] run source=baostock mode=历史回放 2026-07-22 positions=1
+[2026-07-23 10:43:08] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:43:08] no_signal positions=1
+[2026-07-23 10:44:02] run source=baostock mode=实时 positions=1
+[2026-07-23 10:44:02] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:44:02] no_signal positions=1
+[2026-07-23 10:45:30] run source=baostock mode=历史回放 2026-07-22 positions=1
+[2026-07-23 10:45:30] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:45:30] no_signal positions=1
+[2026-07-23 10:46:26] run source=baostock mode=历史回放 2026-07-22 positions=1
+[2026-07-23 10:46:29] no_signal positions=1
+[2026-07-23 10:46:39] run source=baostock mode=实时 positions=1
+[2026-07-23 10:46:42] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:46:42] no_signal positions=1
+[2026-07-23 10:47:12] run source=baostock mode=历史回放 2026-07-22 positions=1
+[2026-07-23 10:47:15] no_signal positions=1
+[2026-07-23 10:47:43] run source=baostock mode=实时 positions=1
+[2026-07-23 10:47:45] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:47:45] no_signal positions=1
+[2026-07-23 10:47:54] run source=baostock mode=实时 positions=1
+[2026-07-23 10:47:56] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:47:56] no_signal positions=1
+[2026-07-23 10:48:15] run source=baostock mode=实时 positions=1
+[2026-07-23 10:48:18] 600029.SH: skip — 数据不足 (0 bars, source=None)
+[2026-07-23 10:48:18] no_signal positions=1
+[2026-07-23 10:48:37] run source=baostock mode=历史回放 2026-07-22 positions=1
+[2026-07-23 10:48:42] no_signal positions=1
+[2026-07-23 10:57:23] run source=eastmoney mode=实时 positions=1
+[2026-07-23 10:57:24] no_signal positions=1
+[2026-07-23 10:59:20] run source=eastmoney mode=实时 positions=1
+[2026-07-23 10:59:21] no_signal positions=1
+[2026-07-23 11:08:43] run source=eastmoney mode=实时 positions=1
+[2026-07-23 11:08:44] no_signal positions=1
+[2026-07-23 11:09:50] run source=eastmoney mode=实时 positions=1
+[2026-07-23 11:09:54] no_signal positions=1

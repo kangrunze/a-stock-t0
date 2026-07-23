@@ -204,7 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--end", default=None, help="结束日期 YYYY-MM-DD")
     parser.add_argument("--days", type=int, default=7, help="回溯天数（无 --start 时用）")
     parser.add_argument("--source", default="auto",
-                        choices=["auto", "mootdx", "westock", "baostock"])
+                        choices=["auto", "mootdx", "westock", "baostock", "eastmoney"])
     parser.add_argument("--base-shares", type=int, default=3000, help="底仓股数")
     parser.add_argument("--avg-cost", type=float, default=None, help="底仓成本")
     args = parser.parse_args()

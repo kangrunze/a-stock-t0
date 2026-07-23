@@ -10,9 +10,11 @@ T-eligible 候选筛选器
   3. 当日非一字板/一字跌停（封死无法成交）
   4. 单笔预期捕获空间 ≥ 0.6%（覆盖来回交易成本后正边际）
 
-数据源: westock kline（日级，取最近20日）+ quote（当日状态）
+数据源:
+  - westock kline（日级，取最近20日）+ quote（当日状态）  [默认]
+  - baostock 日线（westock 不可用时降级，仅检查条件1+2，跳过3+4）
 
-独立性: 仅依赖 westock-data CLI，不依赖 L1-L4。
+独立性: 仅依赖 westock-data CLI 或 baostock，不依赖 L1-L4。
 """
 
 from __future__ import annotations
@@ -131,3 +133,211 @@ if __name__ == "__main__":
     print(f"  预期捕获: {r.expected_capture*100:.2f}%" if r.expected_capture else "  预期捕获: N/A")
     for reason in r.reasons:
         print(f"    {reason}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# baostock 数据源（westock 不可用时降级）
+# ═══════════════════════════════════════════════════════════════
+def _normalize_to_bs_code(code: str) -> Optional[str]:
+    """把任意格式代码归一化为 baostock 代码（sh.600000 / sz.000001）。"""
+    s = code.strip().lower().replace(".sh", "").replace(".sz", "")
+    s = s.replace("sh", "").replace("sz", "").replace(".", "")
+    if not (len(s) == 6 and s.isdigit()):
+        return None
+    head = s[0]
+    if head == "6":
+        return f"sh.{s}"
+    elif head in ("0", "3"):
+        return f"sz.{s}"
+    return None
+
+
+def _screen_candidate_bs_core(
+    bs_code: str,
+    params: ScreenerParams,
+    start_str: str,
+    end_str: str,
+    result: ScreenResult,
+) -> None:
+    """
+    baostock 筛选核心逻辑（假设已登录）。
+
+    查询日线 → 计算振幅/成交额 → 填充 result.reasons。
+    任何失败写入 result.reasons 带 ✗ 标记，由调用方判定 eligible。
+    """
+    import baostock as bs
+
+    rs = bs.query_history_k_data_plus(
+        bs_code,
+        "date,open,high,low,close,preclose,amount",
+        start_date=start_str,
+        end_date=end_str,
+        frequency="d",
+        adjustflag="2",  # 2=前复权
+    )
+    if rs.error_code != "0":
+        result.reasons.append(f"baostock 查询失败: {rs.error_msg} ✗")
+        return
+
+    rows = []
+    while rs.next():
+        rows.append(rs.get_row_data())
+
+    if len(rows) < 20:
+        result.reasons.append(f"日线数据不足({len(rows)}<20)，跳过 ✗")
+        return
+
+    # 取最近 20 个交易日
+    rows = rows[-20:]
+    amplitudes = []
+    amounts = []
+    for row in rows:
+        try:
+            high = float(row[2])
+            low = float(row[3])
+            preclose = float(row[5])
+            amount = float(row[6])
+            if preclose > 0:
+                amplitudes.append((high - low) / preclose)
+            amounts.append(amount)
+        except (ValueError, IndexError):
+            continue
+
+    if amplitudes:
+        result.avg_amplitude_20d = sum(amplitudes) / len(amplitudes)
+        if result.avg_amplitude_20d >= params.min_20d_amplitude:
+            result.reasons.append(
+                f"20日均振幅 {result.avg_amplitude_20d*100:.2f}% ≥ {params.min_20d_amplitude*100:.1f}% ✓"
+            )
+        else:
+            result.reasons.append(
+                f"20日均振幅 {result.avg_amplitude_20d*100:.2f}% < {params.min_20d_amplitude*100:.1f}% ✗"
+            )
+
+    if amounts:
+        result.avg_amount_20d = sum(amounts) / len(amounts)
+        if result.avg_amount_20d >= params.min_20d_amount:
+            result.reasons.append(
+                f"20日均额 {result.avg_amount_20d/1e8:.2f}亿 ≥ 1亿 ✓"
+            )
+        else:
+            result.reasons.append(
+                f"20日均额 {result.avg_amount_20d/1e8:.2f}亿 < 1亿 ✗"
+            )
+
+    # baostock 无实时 quote，跳过条件3+4，标记为未知
+    result.is_one_word_board = None
+    result.expected_capture = result.avg_amplitude_20d  # 用20日均振幅近似
+    result.reasons.append("baostock 无实时报价，跳过一字板/捕获空间检查 ⚠")
+
+
+def screen_candidate_baostock(
+    code: str,
+    params: Optional[ScreenerParams] = None,
+    end_date: Optional[str] = None,
+) -> ScreenResult:
+    """
+    用 baostock 日线数据进行 T-eligible 筛选（条件1+2）。
+
+    baostock 无法获取当日实时 quote，故跳过条件3（一字板）和条件4（预期捕获空间）。
+    筛选结果仅基于 20 日历史振幅 + 成交额，适合作为批量候选池预筛。
+
+    :param code: 任意格式代码（sh600000 / 600000.SH / sh.600000 均可）
+    :param end_date: 截止日期 YYYY-MM-DD，默认今天
+    """
+    import baostock as bs
+    from datetime import datetime, timedelta
+
+    params = params or DEFAULT_SCREENER_PARAMS
+    result = ScreenResult(code=code, eligible=False, reasons=[])
+
+    bs_code = _normalize_to_bs_code(code)
+    if bs_code is None:
+        result.reasons.append(f"代码格式错误: {code} ✗")
+        return result
+
+    # 日期范围：往前推 35 自然日确保有 20 个交易日
+    end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
+    start = end - timedelta(days=35)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        result.reasons.append(f"baostock 登录失败: {lg.error_msg} ✗")
+        return result
+    try:
+        _screen_candidate_bs_core(bs_code, params, start_str, end_str, result)
+    finally:
+        bs.logout()
+
+    # 综合判定：无 ✗ 项即 eligible（⚠ 不算失败）
+    has_fail = any("✗" in r for r in result.reasons)
+    result.eligible = not has_fail and len(result.reasons) >= 2
+    return result
+
+
+def screen_hs300_baostock(
+    params: Optional[ScreenerParams] = None,
+    end_date: Optional[str] = None,
+    max_count: int = 20,
+) -> list[ScreenResult]:
+    """
+    从沪深300成分股中批量筛选 T-eligible 候选。
+
+    共享单个 baostock session（避免 300 次 login/logout）。
+    :return: 符合条件的 ScreenResult 列表（按振幅降序）
+    """
+    import baostock as bs
+    from datetime import datetime, timedelta
+
+    params = params or DEFAULT_SCREENER_PARAMS
+
+    end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
+    start = end - timedelta(days=35)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        print(f"[screener] baostock 登录失败: {lg.error_msg}")
+        return []
+
+    try:
+        # 1. 获取沪深300成分股
+        rs = bs.query_hs300_stocks()
+        if rs.error_code != "0":
+            print(f"[screener] 获取沪深300成分股失败: {rs.error_msg}")
+            return []
+
+        hs300_codes = []
+        while rs.next():
+            row = rs.get_row_data()
+            hs300_codes.append((row[1], row[2] if len(row) > 2 else ""))
+        print(f"[screener] 沪深300成分股共 {len(hs300_codes)} 只，开始批量筛选...")
+
+        # 2. 逐只筛选（共享 session，不重复登录）
+        eligible_list: list[ScreenResult] = []
+        for i, (code, name) in enumerate(hs300_codes):
+            result = ScreenResult(code=code, eligible=False, reasons=[])
+            _screen_candidate_bs_core(code, params, start_str, end_str, result)
+
+            has_fail = any("✗" in r for r in result.reasons)
+            result.eligible = not has_fail and len(result.reasons) >= 2
+
+            if result.eligible:
+                eligible_list.append(result)
+                print(f"  [{i+1}/{len(hs300_codes)}] {code} {name}  ✓ 振幅={result.avg_amplitude_20d*100:.2f}% 额={result.avg_amount_20d/1e8:.1f}亿")
+            else:
+                fails = [x for x in result.reasons if "✗" in x]
+                if i % 20 == 0:
+                    print(f"  [{i+1}/{len(hs300_codes)}] 进度... 当前入选 {len(eligible_list)} 只")
+
+            if len(eligible_list) >= max_count:
+                print(f"[screener] 已达目标数量 {max_count}，停止（扫描了 {i+1} 只）")
+                break
+    finally:
+        bs.logout()
+
+    eligible_list.sort(key=lambda x: x.avg_amplitude_20d or 0, reverse=True)
+    return eligible_list
