@@ -1,0 +1,16 @@
+# research.yaml — 研究阶段 overlay
+# 覆盖 thresholds.yaml 的部分字段，不覆盖整个配置。
+# 由 config_loader 合并加载：base(thresholds.yaml) → overlay(research.yaml)
+#
+# 研究阶段特点：
+#   - 成本用 base 场景（标准佣金+滑点）
+#   - 仓位上限较低（单只 25%）
+#   - 不启用实盘风控的强制平仓
+
+cost_model:
+  scenario: base
+
+risk:
+  max_position_pct: 0.25      # 单只持仓上限 25%
+  max_t_size: 0.25            # 单次 T 操作上限 25%
+  eod_force_flat: false       # 研究阶段不强制尾盘平仓

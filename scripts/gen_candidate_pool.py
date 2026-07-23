@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 from datetime import datetime
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from candidate_screener import screen_hs300_baostock, DEFAULT_SCREENER_PARAMS
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from at0.screener import screen_hs300_baostock, DEFAULT_SCREENER_PARAMS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUT = PROJECT_ROOT / "outputs" / "backtest" / "candidate_pool.json"

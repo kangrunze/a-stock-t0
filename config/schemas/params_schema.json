@@ -1,0 +1,43 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "A-T0 thresholds.yaml schema",
+  "description": "配置文件 schema，用于验证 thresholds.yaml 和 overlay 的字段完整性",
+  "type": "object",
+  "required": ["signal", "risk", "cost_model"],
+  "properties": {
+    "signal": {
+      "type": "object",
+      "description": "信号参数（对应 at0.strategy.SignalParams）",
+      "properties": {
+        "vwap_dev_atr_multiplier": {"type": "number", "default": 0.8},
+        "rsi_overbought": {"type": "number", "default": 70.0},
+        "rsi_oversold": {"type": "number", "default": 30.0},
+        "kdj_overbought": {"type": "number", "default": 80.0},
+        "kdj_oversold": {"type": "number", "default": 20.0},
+        "trend_filter_enabled": {"type": "boolean", "default": true},
+        "adx_trend_threshold": {"type": "number", "default": 25.0},
+        "adx_extreme_threshold": {"type": "number", "default": 40.0},
+        "extreme_vwap_dev_multiplier": {"type": "number", "default": 2.0},
+        "extreme_min": {"type": "integer", "default": 2},
+        "confirm_min": {"type": "integer", "default": 1},
+        "min_rules_to_trigger": {"type": "integer", "default": 3}
+      }
+    },
+    "risk": {
+      "type": "object",
+      "description": "风控参数（对应 at0.risk.RiskParams）",
+      "properties": {
+        "max_position_pct": {"type": "number"},
+        "max_t_size": {"type": "number"},
+        "eod_force_flat": {"type": "boolean"}
+      }
+    },
+    "cost_model": {
+      "type": "object",
+      "description": "成本模型参数（对应 at0.risk.CostModel）",
+      "properties": {
+        "scenario": {"type": "string", "enum": ["optimistic", "base", "pessimistic"]}
+      }
+    }
+  }
+}

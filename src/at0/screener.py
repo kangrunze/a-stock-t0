@@ -1,7 +1,6 @@
-#!/usr/bin/env python3
 """
-T-eligible 候选筛选器
-====================
+A-T0 T-eligible 候选筛选器
+========================
 方案 v0.2 第二节：对持仓/候选标的进行 T-eligible 筛选。
 
 筛选条件:
@@ -14,15 +13,14 @@ T-eligible 候选筛选器
   - westock kline（日级，取最近20日）+ quote（当日状态）  [默认]
   - baostock 日线（westock 不可用时降级，仅检查条件1+2，跳过3+4）
 
-独立性: 仅依赖 westock-data CLI 或 baostock，不依赖 L1-L4。
+独立性: 仅依赖 at0.data（westock CLI 封装），不依赖其他业务模块。
 """
-
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
 
-from westock_client import run_westock, to_westock_symbol
+from .data import run_westock, to_westock_symbol
 
 
 @dataclass
@@ -42,10 +40,10 @@ class ScreenResult:
     code: str
     eligible: bool
     reasons: list[str]
-    avg_amplitude_20d: Optional[float] = None    # 20日平均振幅
-    avg_amount_20d: Optional[float] = None       # 20日日均成交额
-    is_one_word_board: Optional[bool] = None     # 当日是否一字板
-    expected_capture: Optional[float] = None     # 预期捕获空间
+    avg_amplitude_20d: Optional[float] = None
+    avg_amount_20d: Optional[float] = None
+    is_one_word_board: Optional[bool] = None
+    expected_capture: Optional[float] = None
 
 
 def screen_candidate(code: str, params: Optional[ScreenerParams] = None) -> ScreenResult:
@@ -187,7 +185,6 @@ def _screen_candidate_bs_core(
         result.reasons.append(f"日线数据不足({len(rows)}<20)，跳过 ✗")
         return
 
-    # 取最近 20 个交易日
     rows = rows[-20:]
     amplitudes = []
     amounts = []
@@ -225,9 +222,8 @@ def _screen_candidate_bs_core(
                 f"20日均额 {result.avg_amount_20d/1e8:.2f}亿 < 1亿 ✗"
             )
 
-    # baostock 无实时 quote，跳过条件3+4，标记为未知
     result.is_one_word_board = None
-    result.expected_capture = result.avg_amplitude_20d  # 用20日均振幅近似
+    result.expected_capture = result.avg_amplitude_20d
     result.reasons.append("baostock 无实时报价，跳过一字板/捕获空间检查 ⚠")
 
 
@@ -256,7 +252,6 @@ def screen_candidate_baostock(
         result.reasons.append(f"代码格式错误: {code} ✗")
         return result
 
-    # 日期范围：往前推 35 自然日确保有 20 个交易日
     end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
     start = end - timedelta(days=35)
     start_str = start.strftime("%Y-%m-%d")
@@ -271,7 +266,6 @@ def screen_candidate_baostock(
     finally:
         bs.logout()
 
-    # 综合判定：无 ✗ 项即 eligible（⚠ 不算失败）
     has_fail = any("✗" in r for r in result.reasons)
     result.eligible = not has_fail and len(result.reasons) >= 2
     return result
@@ -304,7 +298,6 @@ def screen_hs300_baostock(
         return []
 
     try:
-        # 1. 获取沪深300成分股
         rs = bs.query_hs300_stocks()
         if rs.error_code != "0":
             print(f"[screener] 获取沪深300成分股失败: {rs.error_msg}")
@@ -316,7 +309,6 @@ def screen_hs300_baostock(
             hs300_codes.append((row[1], row[2] if len(row) > 2 else ""))
         print(f"[screener] 沪深300成分股共 {len(hs300_codes)} 只，开始批量筛选...")
 
-        # 2. 逐只筛选（共享 session，不重复登录）
         eligible_list: list[ScreenResult] = []
         for i, (code, name) in enumerate(hs300_codes):
             result = ScreenResult(code=code, eligible=False, reasons=[])

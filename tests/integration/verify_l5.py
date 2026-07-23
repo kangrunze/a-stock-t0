@@ -13,7 +13,7 @@ L5 模块端到端验证脚本
   6. 独立性验证：L1/L2 文件不存在时 L5 仍可运行
 
 运行方式:
-  python verify_l5.py
+  python tests/integration/verify_l5.py
 """
 
 from __future__ import annotations
@@ -24,19 +24,29 @@ import sys
 import tempfile
 from pathlib import Path
 
-# 确保能导入同目录脚本
-SCRIPT_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(SCRIPT_DIR))
+# 让 at0 包可导入
+_SRC_DIR = Path(__file__).resolve().parent.parent.parent / "src"
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 
-import position_tracker
-import intraday_reference
-import t_signal_engine
-import t_risk_guard
-import t_trade_logger
-import backtest_t_strategy
-import market_layer
-import stock_quote_features
-from minute_bar_fetcher import save_minute_bars_to_csv
+from at0 import execution as position_tracker
+from at0 import features as intraday_reference
+from at0 import strategy as t_signal_engine
+from at0 import risk as t_risk_guard
+from at0 import backtest as backtest_t_strategy
+from at0.features import (
+    MarketSnapshot,
+    market_gate_for_add,
+    market_gate_for_reduce,
+    adjust_signal_weight,
+    compute_market_snapshot,
+    fetch_futures_basis,
+    merge_with_reference_snapshot,
+)
+# market_layer / stock_quote_features 已并入 at0.features，保留别名以最小化改动
+market_layer = intraday_reference
+stock_quote_features = intraday_reference
+from at0.data import save_minute_bars_to_csv
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -233,6 +243,8 @@ def test_signal_engine(runner: TestRunner):
     # 场景 B: 下探地量企稳 → 应触发加仓
     # 注意：企稳阶段 close 必须有涨有跌（真实横盘），否则若 close 单调
     # 微升，RSI 会误判为 100（超买），导致 reduce 信号同时触发。
+    # P0-5: 三层结构要求 extreme≥2，此处用 extreme_min=1 测试基本触发逻辑
+    # （三层约束由 test_p0_modules.py 的 test_trend_filter_on_signals 覆盖）
     bars_dip = []
     for i in range(40):
         if i < 25:
@@ -250,8 +262,9 @@ def test_signal_engine(runner: TestRunner):
             "close": close, "volume": max(vol, 100),
             "amount": close * max(vol, 100),
         })
+    params_dip = t_signal_engine.SignalParams(extreme_min=1)
     result_dip = t_signal_engine.evaluate_all_signals(
-        bars_dip, current_price=9.70, prev_close=10.00
+        bars_dip, current_price=9.70, prev_close=10.00, params=params_dip
     )
     runner.check("下探企稳触发 add",
                  result_dip["recommendation"] == "add",
@@ -398,7 +411,7 @@ def test_backtest_e2e(runner: TestRunner):
         runner.check("回测产生交易或无交易（都正常）",
                      result["t_trades"] >= 0)
         runner.check("尾盘状态有效",
-                     result["eod_status"] in {"balanced", "net_reduce", "net_add", "insufficient_bars"})
+                     result["eod_status"] in {"balanced", "net_reduce", "net_add", "insufficient_bars", "has_expired_legs"})
         print(f"    → T次数={result['t_trades']}, 净盈亏={result['net_pnl']:.2f}, "
               f"胜率={result['win_rate']*100:.0f}%")
 
@@ -583,12 +596,12 @@ def test_quote_features_and_layer_structure(runner: TestRunner):
         bars_spike, current_price=10.35, prev_close=10.00
     )
     reduce_sig = result["reduce_signal"]
-    runner.check("reduce 有 layer_scores(content/filter)",
-                 "content" in reduce_sig.layer_scores and "filter" in reduce_sig.layer_scores)
-    runner.check("reduce 内容项 ≥1 触发", reduce_sig.layer_scores["content"] >= 1)
+    runner.check("reduce 有 layer_scores(extreme/confirm/filter)",
+                 "extreme" in reduce_sig.layer_scores and "confirm" in reduce_sig.layer_scores and "filter" in reduce_sig.layer_scores)
+    runner.check("reduce 极值层 ≥1 触发", reduce_sig.layer_scores["extreme"] >= 1)
     runner.check("reduce 过滤项通过", reduce_sig.layer_scores["filter"] == 1)
-    runner.check("reduce 有 trend_context", reduce_sig.trend_context in {"trend_up", "trend_down", "range"})
-    runner.check("reduce 分数 ≤4", reduce_sig.rules_score <= 4)
+    runner.check("reduce 有 trend_context", reduce_sig.trend_context in {"trend_up", "trend_down", "range", "extreme"})
+    runner.check("reduce 分数 ≤5", reduce_sig.rules_score <= 5)
 
     # 市场层门控接入：COLD 市场 + 冲高缩量数据 → reduce 仍可触发，add 被拦截
     cold = market_layer.MarketSnapshot(
@@ -620,8 +633,8 @@ def test_quote_features_and_layer_structure(runner: TestRunner):
 def test_candidate_screener_and_config(runner: TestRunner):
     print("\n[10] candidate_screener + config_loader 验证")
 
-    import candidate_screener
-    import config_loader
+    from at0 import screener as candidate_screener
+    from at0 import config as config_loader
 
     # ScreenerParams 默认值
     sp = candidate_screener.ScreenerParams()
@@ -660,8 +673,12 @@ def test_candidate_screener_and_config(runner: TestRunner):
             runner.check("yaml 加载 SignalParams RSI=70",
                          abs(sig_params.rsi_overbought - 70.0) < 1e-9)
             risk_params = config_loader.load_risk_params()
-            runner.check("yaml 加载 RiskParams spread=0.006",
-                         abs(risk_params.min_capture_spread - 0.006) < 1e-9)
+            runner.check("yaml 加载 RiskParams spread=0.0075",
+                         abs(risk_params.min_capture_spread - 0.0075) < 1e-9)
+            runner.check("yaml 加载 RiskParams round_trip=0.003",
+                         abs(risk_params.round_trip_cost - 0.003) < 1e-9)
+            runner.check("yaml 加载 RiskParams max_t_size=0.25",
+                         abs(risk_params.max_t_size_ratio - 0.25) < 1e-9)
         except ImportError:
             runner.check("PyYAML 未安装，跳过 yaml 加载测试", True)
 

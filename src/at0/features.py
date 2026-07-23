@@ -1,26 +1,60 @@
-#!/usr/bin/env python3
 """
-L5 日内参考指标计算器
-======================
-基于 1 分钟 K 线滚动计算所有 L5 信号所需的参考指标。
-严格因果：任何时刻 t 的指标只用 [0, t] 区间的数据，绝不用未来数据。
+features 层合并模块
+==================
 
-提供的指标:
-  - cumulative_vwap(bars_up_to_t):  截至当前时刻的累计 VWAP
-  - vwap_deviation(price, vwap):    VWAP 偏离度
-  - intraday_bollinger(bars, t):    日内动态布林带 MA(20)±2σ
-  - opening_range(bars):            开盘区间（9:30-10:00 高低点）
-  - intraday_atr(bars, period=14):  日内 ATR（用 1 分钟 K 线的 TR）
-  - rsi(bars, period=14):           分钟级 RSI
-  - kdj(bars, n=9, m1=3, m2=3):     分钟级 KDJ
-  - volume_ratio(bars, lookback=5, baseline=20): 量比
+本模块合并了原 scripts/ 下三个特征计算文件，统一作为 a-t0 项目 features 层的入口。
+所有特征计算（reference / quote / market）都在此模块中，供 strategy 与 risk 层调用。
 
-独立性：纯计算模块，不依赖 L1/L2/L3/L4，也不依赖外部数据源。
+包含四类指标：
+  - reference 层：VWAP、ATR、RSI、KDJ、MFI、布林带(BB)、MACD、DMI/ADX、EMA/MA、
+                  CCI、BIAS、ROC、OBV + 综合快照 compute_reference_snapshot
+                  + 市场状态识别 detect_market_regime
+  - quote 盘口特征层：从 westock quote 拉取现成盘口/资金字段，派生订单流代理指标
+  - market 市场层：跨股票共享的日内市场状态（情绪/题材/门控），作为个股层门控
+                  与权重调整依据
+
+合并来源：
+  - scripts/intraday_reference.py  → reference 层（含 detect_market_regime）
+  - scripts/stock_quote_features.py → quote 盘口特征层
+  - scripts/market_layer.py         → market 市场层
+
+注意：
+  - 原始函数、类、常量的实现未做任何逻辑修改，仅做了 import 路径调整。
+  - westock_client 的调用已改为 `from .data import run_westock, to_westock_symbol`
+    （data.py 会合并 westock_client）。
+  - l2_theme_reader 作为独立模块保留（scripts/l2_theme_reader.py 或随迁移保留）。
+  - 不创建 __init__.py（由调用方单独创建）。
 """
 
 from __future__ import annotations
 
+# ── 顶层 import（合并三个文件的公共依赖）──
+from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
+
+from .data import run_westock, to_westock_symbol, get_themes_snapshot
+
+
+# ═══ features: reference 层（VWAP/ATR/RSI/KDJ/MFI/BB/MACD/DMI/ADX） ═══
+# 原文件: scripts/intraday_reference.py
+#
+# L5 日内参考指标计算器
+# ======================
+# 基于 1 分钟 K 线滚动计算所有 L5 信号所需的参考指标。
+# 严格因果：任何时刻 t 的指标只用 [0, t] 区间的数据，绝不用未来数据。
+#
+# 提供的指标:
+#   - cumulative_vwap(bars_up_to_t):  截至当前时刻的累计 VWAP
+#   - vwap_deviation(price, vwap):    VWAP 偏离度
+#   - intraday_bollinger(bars, t):    日内动态布林带 MA(20)±2σ
+#   - opening_range(bars):            开盘区间（9:30-10:00 高低点）
+#   - intraday_atr(bars, period=14):  日内 ATR（用 1 分钟 K 线的 TR）
+#   - rsi(bars, period=14):           分钟级 RSI
+#   - kdj(bars, n=9, m1=3, m2=3):     分钟级 KDJ
+#   - volume_ratio(bars, lookback=5, baseline=20): 量比
+#
+# 独立性：纯计算模块，不依赖 L1/L2/L3/L4，也不依赖外部数据源。
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -666,7 +700,71 @@ def _consecutive_shrink_no_new_low(bars: list[dict], lookback: int = 3) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 自检
+# 市场状态识别（P0-6: regime 归入 features 层）
+# ═══════════════════════════════════════════════════════════════
+def detect_market_regime(
+    snap: dict,
+    adx_trend_threshold: float = 25.0,
+    adx_extreme_threshold: float = 40.0,
+    extreme_vwap_dev_multiplier: float = 2.0,
+    min_bars_for_trend: int = 60,
+) -> str:
+    """
+    基于 MACD + DMI/ADX + VWAP偏离度 判定市场状态。
+
+    P0-6 核心函数：regime 作为 features 层输出，strategy 和 risk 都可读，
+    避免 risk 反向依赖 strategy。
+
+    返回:
+      "trend_up"   : MACD 金叉 + +DI > -DI + ADX ≥ 趋势阈值 → 上升趋势
+      "trend_down" : MACD 死叉 + -DI > +DI + ADX ≥ 趋势阈值 → 下降趋势
+      "extreme"    : ADX ≥ 极端阈值 且 |VWAP偏离| ≥ extreme_mult × ATR相对值 → 极端趋势
+      "range"      : 其余（震荡或数据不足）
+
+    设计要点:
+      - extreme 优先判定：即使 MACD/DI 方向不明确，ADX 极高 + 价格远离 VWAP 即为极端
+      - trend_up/down 需要三重确认（MACD + DI + ADX），减少假信号
+      - 数据不足时返回 "range"（保守不拦截）
+      - min_bars_for_trend: ADX/DMI 需 28 根预热 + 至少 32 根数据才可靠，
+        不足 60 根时不做趋势判定（避免短样本 ADX 极端值误触发）
+    """
+    # ADX/DMI 需要足够数据才可靠（28根预热 + 至少32根数据 = 60根）
+    bars_count = snap.get("bars_count", 0)
+    if bars_count < min_bars_for_trend:
+        return "range"
+
+    macd_dif = snap.get("macd_dif")
+    macd_dea = snap.get("macd_dea")
+    pdi = snap.get("pdi")
+    mdi = snap.get("mdi")
+    adx = snap.get("adx")
+    vwap = snap.get("vwap")
+    vwap_dev = snap.get("vwap_dev")
+    atr = snap.get("atr")
+
+    if None in (macd_dif, macd_dea, pdi, mdi, adx):
+        return "range"
+
+    # 极端趋势：ADX 极高 + 价格远离 VWAP
+    if adx >= adx_extreme_threshold:
+        if vwap and vwap > 0 and atr and atr > 0 and vwap_dev is not None:
+            atr_relative = atr / vwap
+            extreme_dev = extreme_vwap_dev_multiplier * atr_relative
+            if abs(vwap_dev) >= extreme_dev:
+                return "extreme"
+
+    if adx < adx_trend_threshold:
+        return "range"
+
+    if macd_dif > macd_dea and pdi > mdi:
+        return "trend_up"
+    if macd_dif < macd_dea and mdi > pdi:
+        return "trend_down"
+    return "range"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 自检（reference 层）
 # ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     # 构造 60 根 1 分钟 K 线：前 40 根缓慢上行，后 20 根冲高回落
@@ -717,3 +815,502 @@ if __name__ == "__main__":
     print(f"  相邻 K 值最大跳变: {max_jump:.4f}")
     assert max_jump < 5.0, f"KDJ K 值跳变过大 ({max_jump:.2f})，可能仍从 50 起跳"
     print("[PASS] KDJ 连续递推验证通过（无锯齿状跳变）")
+
+
+# ═══ features: quote 盘口特征层 ═══
+# 原文件: scripts/stock_quote_features.py
+#
+# 个股盘口特征层（Stock Quote Features）
+# ======================================
+# 从 westock quote 拉取现成的盘口/资金字段（无需自己算），与 intraday_reference
+# 的特征计算层快照合并，供决策层（t_signal_engine）使用。
+#
+# westock quote 已返回的字段（实测 sh600000）:
+#   - avg_price         = VWAP（现成，可交叉校验自算累计 VWAP）
+#   - volume_ratio      = 量比（现成）
+#   - turnover_rate     = 换手率（现成）
+#   - range_pct         = 振幅（现成）
+#   - wb_ratio          = 委比（订单失衡代理）
+#   - inner_volume      = 内盘（主动卖，Lee-Ready 近似）
+#   - outer_volume      = 外盘（主动买，Lee-Ready 近似）
+#   - price_ceiling     = 涨停价（现成，覆盖 prev_close×1.1 估算）
+#   - price_floor       = 跌停价（现成）
+#   - price / prev_close / open / high / low / volume / amount
+#
+# 本模块不重复计算 intraday_reference 已有的指标，只补充 westock 现成字段 +
+# 派生的订单流代理指标。
+#
+# 独立性：仅依赖 westock-data CLI（实盘）或调用方注入的 quote dict（回测）。
+
+
+# ═══════════════════════════════════════════════════════════════
+# 盘口特征提取
+# ═══════════════════════════════════════════════════════════════
+def fetch_quote_features(code: str) -> dict:
+    """
+    从 westock quote 拉取盘口/资金字段，返回标准化 dict。
+
+    所有数值字段失败时为 None，不抛异常。
+    """
+    symbol = to_westock_symbol(code)
+    raw = run_westock(f"quote {symbol}")
+    if isinstance(raw, list) and raw:
+        item = raw[0]
+    elif isinstance(raw, dict):
+        item = raw
+    else:
+        item = None
+    if not item:
+        return {}
+
+    def _f(key: str) -> Optional[float]:
+        v = item.get(key)
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _i(key: str) -> Optional[int]:
+        v = item.get(key)
+        try:
+            return int(float(v)) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "code": code,
+        "name": item.get("name"),
+        # ── 价格（westock 现成，比 prev_close×1.1 估算更准）──
+        "current_price": _f("price"),
+        "prev_close": _f("prev_close"),
+        "open": _f("open"),
+        "high": _f("high"),
+        "low": _f("low"),
+        "limit_up": _f("price_ceiling"),    # 现成涨停价
+        "limit_down": _f("price_floor"),    # 现成跌停价
+        # ── 量能/资金（westock 现成）──
+        "quote_vwap": _f("avg_price"),       # westock 算好的 VWAP
+        "quote_volume_ratio": _f("volume_ratio"),
+        "turnover_rate": _f("turnover_rate"),
+        "amplitude_pct": _f("range_pct"),
+        "volume": _i("volume"),
+        "amount": _f("amount"),
+        # ── 订单流代理（westock 现成）──
+        "wb_ratio": _f("wb_ratio"),          # 委比 = 订单失衡代理
+        "inner_volume": _i("inner_volume"),  # 内盘 = 主动卖
+        "outer_volume": _i("outer_volume"),  # 外盘 = 主动买
+    }
+
+
+def compute_order_flow_proxy(quote_feats: dict) -> dict:
+    """
+    基于盘口字段派生订单流代理指标。
+
+    返回:
+      - active_buy_ratio: 主动买占比 = outer / (inner + outer)，0-1
+      - active_sell_ratio: 主动卖占比 = inner / (inner + outer)，0-1
+      - order_imbalance_pct: 委比（直接用 wb_ratio，正数偏买、负数偏卖）
+      - vwap_dev_from_quote: (price - quote_vwap) / quote_vwap，与自算 vwap_dev 交叉校验
+    """
+    result = {
+        "active_buy_ratio": None,
+        "active_sell_ratio": None,
+        "order_imbalance_pct": None,
+        "vwap_dev_from_quote": None,
+    }
+    inner = quote_feats.get("inner_volume")
+    outer = quote_feats.get("outer_volume")
+    if inner is not None and outer is not None and (inner + outer) > 0:
+        total = inner + outer
+        result["active_buy_ratio"] = outer / total
+        result["active_sell_ratio"] = inner / total
+    result["order_imbalance_pct"] = quote_feats.get("wb_ratio")
+    price = quote_feats.get("current_price")
+    qvwap = quote_feats.get("quote_vwap")
+    if price is not None and qvwap is not None and qvwap > 0:
+        result["vwap_dev_from_quote"] = (price - qvwap) / qvwap
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# 与特征计算层快照合并
+# ═══════════════════════════════════════════════════════════════
+def merge_with_reference_snapshot(
+    ref_snap: dict,
+    quote_feats: Optional[dict] = None,
+) -> dict:
+    """
+    把盘口特征合并进 intraday_reference 的快照。
+
+    参数:
+      ref_snap: compute_reference_snapshot() 返回的 dict
+      quote_feats: fetch_quote_features() 返回的 dict。None 时跳过（回测无 quote）
+
+    返回: 合并后的 dict（原 ref_snap 的拷贝 + quote 字段 + 派生指标）。
+    保留原 ref_snap 的所有键，quote 字段以 quote_ 前缀或新键名加入，不覆盖。
+    """
+    merged = dict(ref_snap)
+    if not quote_feats:
+        merged["_quote_available"] = False
+        return merged
+
+    merged["_quote_available"] = True
+
+    # 合并 westock 现成字段（用独立键名，不覆盖 ref_snap 的自算值）
+    for k in [
+        "quote_vwap", "quote_volume_ratio", "turnover_rate",
+        "amplitude_pct", "wb_ratio", "inner_volume", "outer_volume",
+    ]:
+        if k in quote_feats:
+            merged[k] = quote_feats[k]
+
+    # 涨跌停价：优先用 westock 的 price_ceiling/floor（比 prev_close×1.1 准）
+    if quote_feats.get("limit_up") is not None:
+        merged["limit_up"] = quote_feats["limit_up"]
+    if quote_feats.get("limit_down") is not None:
+        merged["limit_down"] = quote_feats["limit_down"]
+
+    # 如果 ref_snap 没有 current_price（理论上不会），用 quote 的
+    if merged.get("current_price") is None and quote_feats.get("current_price") is not None:
+        merged["current_price"] = quote_feats["current_price"]
+
+    # 派生订单流代理
+    merged.update(compute_order_flow_proxy(quote_feats))
+
+    return merged
+
+
+# ═══════════════════════════════════════════════════════════════
+# 自检（quote 盘口特征层）
+# ═══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print("=== 盘口特征层自检（实盘 sh600000）===")
+    feats = fetch_quote_features("sh600000")
+    if not feats:
+        print("  [WARN] westock quote 无返回（非交易时段或数据源不可用）")
+    else:
+        for k, v in feats.items():
+            print(f"  {k}: {v}")
+
+        print("\n=== 订单流代理派生 ===")
+        proxy = compute_order_flow_proxy(feats)
+        for k, v in proxy.items():
+            print(f"  {k}: {v}")
+
+    print("\n=== 合并快照测试（注入模拟 ref_snap）===")
+    fake_ref = {
+        "current_price": 9.01,
+        "vwap": 8.89,
+        "vwap_dev": 0.0135,
+        "rsi": 55.0,
+        "kdj_k": 60.0,
+    }
+    merged = merge_with_reference_snapshot(fake_ref, feats if feats else None)
+    print(f"  _quote_available: {merged.get('_quote_available')}")
+    print(f"  ref_snap 键保留: vwap={merged.get('vwap')}, rsi={merged.get('rsi')}")
+    if feats:
+        print(f"  quote 字段合并: quote_vwap={merged.get('quote_vwap')}, wb_ratio={merged.get('wb_ratio')}")
+        print(f"  派生: active_buy_ratio={merged.get('active_buy_ratio')}, "
+              f"order_imbalance_pct={merged.get('order_imbalance_pct')}")
+        print(f"  涨跌停价: limit_up={merged.get('limit_up')}, limit_down={merged.get('limit_down')}")
+
+    # 回测模式（无 quote）
+    print("\n=== 回测模式（无 quote）===")
+    merged_no_q = merge_with_reference_snapshot(fake_ref, None)
+    print(f"  _quote_available: {merged_no_q.get('_quote_available')}")
+    print(f"  ref_snap 键保留: vwap={merged_no_q.get('vwap')}")
+
+
+# ═══ features: market 市场层（情绪/题材/门控） ═══
+# 原文件: scripts/market_layer.py
+#
+# 市场层（Market Layer）
+# ======================
+# 跨股票共享的日内市场状态，刷新频率低于个股层（建议 1-3 分钟一次）。
+# 作为个股层（Layer A/B/C）的门控与权重调整依据。
+#
+# 数据源：
+#   - 涨跌停数量 / 上涨占比：westock changedist（实时）
+#   - 板块热度 / 行业排名：westock sector ranking（实时）
+#   - 期指升贴水：westock 暂不支持国内 IF/IH/IC/IM，接口保留返回 None（二期接券商源）
+#   - 题材状态（可选 fallback）：软依赖 ashare-sop-engine 的 themes_v17.json
+#
+# 独立性：不依赖 L1/L2/L3/L4。themes_v17.json 不存在时按默认值处理。
+# 仅依赖 westock-data CLI（实盘）或调用方传入的缓存数据（回测）。
+
+
+# ═══════════════════════════════════════════════════════════════
+# 市场快照数据结构
+# ═══════════════════════════════════════════════════════════════
+@dataclass
+class MarketSnapshot:
+    """市场层快照。所有字段在数据不可用时为 None / 空列表，不阻塞个股层。"""
+    # ── 涨跌停 / 情绪（来自 changedist）──
+    up_limit_count: Optional[int] = None       # 涨停家数
+    down_limit_count: Optional[int] = None     # 跌停家数
+    up_count: Optional[int] = None             # 上涨家数
+    down_count: Optional[int] = None           # 下跌家数
+    up_ratio: Optional[float] = None           # 上涨占比（0-100）
+    up_ratio_comment: Optional[str] = None     # 情绪文案
+    total_amount: Optional[float] = None       # 两市成交额（元）
+
+    # ── 板块热度（来自 sector ranking）──
+    top_industries: list[dict] = field(default_factory=list)   # 行业涨幅榜
+    top_concepts: list[dict] = field(default_factory=list)     # 概念涨幅榜
+    top_inflow_sectors: list[dict] = field(default_factory=list)  # 主力资金流入榜
+
+    # ── 期指升贴水（二期，暂未接入）──
+    futures_basis: Optional[dict] = None
+    # 结构: {"if": {"spread": -0.5, "spread_pct": -0.08}, "ih": ..., "ic": ..., "im": ...}
+
+    # ── 题材状态（软依赖 themes_v17.json，可选）──
+    themes_snapshot: Optional[dict] = None
+
+    # ── 元信息 ──
+    timestamp: Optional[str] = None            # 快照时间 ISO
+    source: str = "westock"                    # 数据源标记
+
+    @property
+    def market_sentiment(self) -> str:
+        """
+        市场情绪分级（供个股层门控）。
+
+        判定逻辑（优先级从高到低）:
+          1. 涨停 ≥ 80 且 跌停 ≤ 10 → HOT（赚钱效应强，可正常做T）
+          2. 涨停 ≤ 20 或 跌停 ≥ 50 → COLD（赚钱效应弱，减仓信号宽松/加仓信号严格）
+          3. 上涨占比 ≤ 30% → COOL（偏冷，谨慎）
+          4. 其余 → NEUTRAL
+        数据缺失时返回 NEUTRAL（不阻塞）。
+        """
+        if self.up_limit_count is not None and self.down_limit_count is not None:
+            if self.up_limit_count >= 80 and self.down_limit_count <= 10:
+                return "HOT"
+            if self.up_limit_count <= 20 or self.down_limit_count >= 50:
+                return "COLD"
+        if self.up_ratio is not None and self.up_ratio <= 30:
+            return "COOL"
+        return "NEUTRAL"
+
+    @property
+    def is_tradable_market(self) -> bool:
+        """市场是否适合做T（非 COLD 即可）。COLD 时建议只减不加。"""
+        return self.market_sentiment != "COLD"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 数据采集函数
+# ═══════════════════════════════════════════════════════════════
+def fetch_limit_board_snapshot() -> dict:
+    """
+    从 westock changedist 拉取涨跌停家数 + 上涨占比。
+
+    返回 dict（字段与 MarketSnapshot 涨跌停部分对应）。失败返回空 dict。
+    """
+    data = run_westock("changedist")
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "up_limit_count": data.get("upLimitCount"),
+        "down_limit_count": data.get("downLimitCount"),
+        "up_count": data.get("upCount"),
+        "down_count": data.get("downCount"),
+        "up_ratio": data.get("upRatio"),
+        "up_ratio_comment": data.get("upRatioComment"),
+        "total_amount": data.get("totalAmount"),
+    }
+
+
+def fetch_sector_ranking_snapshot() -> dict:
+    """
+    从 westock sector ranking 拉取板块热度。
+
+    返回 dict，包含:
+      - top_industries: 行业涨幅榜（list[dict]）
+      - top_concepts: 概念涨幅榜（list[dict]）
+      - top_inflow_sectors: 主力资金流入榜（list[dict]）
+    失败返回空 dict。
+    """
+    data = run_westock("sector ranking")
+    if not isinstance(data, dict):
+        return {}
+    sections = data.get("sections", [])
+    result = {
+        "top_industries": [],
+        "top_concepts": [],
+        "top_inflow_sectors": [],
+    }
+    # sections 结构: [行业榜, 概念榜, 资金流入榜]（按 westock 当前返回顺序）
+    if len(sections) >= 1 and isinstance(sections[0], list):
+        result["top_industries"] = sections[0]
+    if len(sections) >= 2 and isinstance(sections[1], list):
+        result["top_concepts"] = sections[1]
+    if len(sections) >= 3 and isinstance(sections[2], list):
+        result["top_inflow_sectors"] = sections[2]
+    return result
+
+
+def fetch_futures_basis() -> Optional[dict]:
+    """
+    期指升贴水（IF/IH/IC/IM 基差）。
+
+    ⚠️ 一期未接入：westock futures 仅支持外盘商品/金融期货 + 港股股指，
+    不支持国内 IF/IH/IC/IM。需二期接券商期货行情源（CTP/Choice/Wind）。
+
+    返回 None 表示数据源未接入，不阻塞个股层。
+    """
+    return None
+
+
+def read_themes_v17() -> Optional[dict]:
+    """
+    软依赖读取 ashare-sop-engine 的 L2 题材数据。
+
+    P1-2: 改为委托 l2_theme_reader.get_themes_snapshot()，
+    统一文件发现逻辑（不再各自猜测文件名）。
+
+    文件不存在时返回 None（a-t0 独立运行，不报错）。
+    """
+    return get_themes_snapshot()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 市场层主入口
+# ═══════════════════════════════════════════════════════════════
+def compute_market_snapshot(
+    use_westock: bool = True,
+    cached_limit_board: Optional[dict] = None,
+    cached_sector_ranking: Optional[dict] = None,
+) -> MarketSnapshot:
+    """
+    汇总市场层快照。
+
+    参数:
+      use_westock: 是否实时调用 westock（实盘 True / 回测 False）
+      cached_limit_board: 预先拉取的 changedist 数据（回测注入，避免重复调用）
+      cached_sector_ranking: 预先拉取的 sector ranking 数据
+
+    返回: MarketSnapshot。任何数据源失败时对应字段为 None/空，不抛异常。
+    """
+    snap = MarketSnapshot(timestamp=datetime.now().isoformat(timespec="seconds"))
+
+    # 涨跌停 / 情绪
+    limit_data = cached_limit_board if cached_limit_board is not None else (
+        fetch_limit_board_snapshot() if use_westock else {}
+    )
+    for k, v in limit_data.items():
+        if hasattr(snap, k):
+            setattr(snap, k, v)
+
+    # 板块热度
+    sector_data = cached_sector_ranking if cached_sector_ranking is not None else (
+        fetch_sector_ranking_snapshot() if use_westock else {}
+    )
+    for k, v in sector_data.items():
+        if hasattr(snap, k):
+            setattr(snap, k, v)
+
+    # 期指升贴水（二期）
+    snap.futures_basis = fetch_futures_basis() if use_westock else None
+
+    # 题材状态（软依赖）
+    snap.themes_snapshot = read_themes_v17()
+
+    return snap
+
+
+# ═══════════════════════════════════════════════════════════════
+# 个股层门控接口
+# ═══════════════════════════════════════════════════════════════
+def market_gate_for_add(market: MarketSnapshot) -> tuple[bool, str]:
+    """
+    加仓门控：市场层是否允许加仓信号触发。
+
+    返回 (allowed, reason)。
+    COLD 市场禁止加仓（只减不加）；其余允许。
+    """
+    sentiment = market.market_sentiment
+    if sentiment == "COLD":
+        return False, f"市场情绪 COLD（涨停{market.up_limit_count}/跌停{market.down_limit_count}），禁止加仓"
+    return True, f"市场情绪 {sentiment}，加仓放行"
+
+
+def market_gate_for_reduce(market: MarketSnapshot) -> tuple[bool, str]:
+    """
+    减仓门控：市场层是否允许减仓信号触发。
+
+    减仓在任何市场情绪下都允许（COLD 时反而更应减仓）。
+    """
+    return True, f"市场情绪 {market.market_sentiment}，减仓放行"
+
+
+def adjust_signal_weight(market: MarketSnapshot, direction: str) -> float:
+    """
+    根据市场情绪调整信号权重（供决策层加权使用）。
+
+    参数:
+      direction: "reduce" 或 "add"
+
+    返回: 权重乘数（0.5 ~ 1.2）
+      - HOT 市场：加仓权重 ↑（回调买入更安全），减仓权重 ↓（趋势可能延续）
+      - COLD 市场：加仓权重 ↓（避免接飞刀），减仓权重 ↑（及时止盈更重要）
+      - NEUTRAL/COOL：1.0
+    """
+    sentiment = market.market_sentiment
+    if direction == "add":
+        return {"HOT": 1.2, "NEUTRAL": 1.0, "COOL": 0.8, "COLD": 0.5}.get(sentiment, 1.0)
+    if direction == "reduce":
+        return {"HOT": 0.8, "NEUTRAL": 1.0, "COOL": 1.1, "COLD": 1.2}.get(sentiment, 1.0)
+    return 1.0
+
+
+# ═══════════════════════════════════════════════════════════════
+# 自检（market 市场层）
+# ═══════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print("=== 市场层自检（实盘拉取）===")
+    snap = compute_market_snapshot(use_westock=True)
+    print(f"  时间: {snap.timestamp}")
+    print(f"  情绪: {snap.market_sentiment} (tradable={snap.is_tradable_market})")
+    print(f"  涨停/跌停: {snap.up_limit_count}/{snap.down_limit_count}")
+    print(f"  上涨/下跌: {snap.up_count}/{snap.down_count} ({snap.up_ratio}%)")
+    print(f"  情绪文案: {snap.up_ratio_comment}")
+    print(f"  两市成交额: {snap.total_amount}")
+    print(f"  行业榜前3: {[s.get('name') for s in snap.top_industries[:3]]}")
+    print(f"  概念榜前3: {[s.get('name') for s in snap.top_concepts[:3]]}")
+    print(f"  资金流入榜前3: {[s.get('name') for s in snap.top_inflow_sectors[:3]]}")
+    print(f"  期指升贴水: {snap.futures_basis}")
+    print(f"  themes_v17: {'已加载' if snap.themes_snapshot else '未加载（独立模式）'}")
+
+    print("\n=== 门控测试 ===")
+    for d in ["add", "reduce"]:
+        allowed, reason = (market_gate_for_add if d == "add" else market_gate_for_reduce)(snap)
+        weight = adjust_signal_weight(snap, d)
+        print(f"  {d}: allowed={allowed}, weight={weight}, reason={reason}")
+
+    print("\n=== 回测模式（注入缓存数据，不调 westock）===")
+    cached_snap = compute_market_snapshot(
+        use_westock=False,
+        cached_limit_board={
+            "up_limit_count": 120, "down_limit_count": 5,
+            "up_count": 3000, "down_count": 2000, "up_ratio": 60,
+            "up_ratio_comment": "市场情绪高涨", "total_amount": 1.5e12,
+        },
+        cached_sector_ranking={
+            "top_industries": [{"name": "半导体", "changePct": "3.5"}],
+            "top_concepts": [{"name": "AI芯片", "changePct": "5.2"}],
+            "top_inflow_sectors": [{"name": "半导体", "mainNetInflow": "100000"}],
+        },
+    )
+    print(f"  情绪: {cached_snap.market_sentiment} (应为 HOT)")
+    print(f"  涨停: {cached_snap.up_limit_count} (应为 120)")
+    print(f"  加仓门控: {market_gate_for_add(cached_snap)}")
+    print(f"  加仓权重: {adjust_signal_weight(cached_snap, 'add')} (应为 1.2)")
+
+    # COLD 场景
+    cold_snap = compute_market_snapshot(
+        use_westock=False,
+        cached_limit_board={"up_limit_count": 10, "down_limit_count": 80, "up_ratio": 20},
+    )
+    print(f"\n  COLD 情绪: {cold_snap.market_sentiment} (应为 COLD)")
+    print(f"  COLD 加仓门控: {market_gate_for_add(cold_snap)}")
+    print(f"  COLD 加仓权重: {adjust_signal_weight(cold_snap, 'add')} (应为 0.5)")

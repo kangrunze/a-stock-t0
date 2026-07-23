@@ -1,4 +1,9 @@
 outputs/backtest/600026_2026-06-22_2026-07-22_report.json
 outputs/*
+!outputs/runs/
+!outputs/runs/.gitkeep
 outputs/backtest/*.json
 scripts/__pycache__/*.pyc
+src/at0/__pycache__/*.pyc
+src/__pycache__/*.pyc
+tests/__pycache__/*.pyc

@@ -13,8 +13,8 @@ import json
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from data_provider import fetch_multi_day
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from at0.data import fetch_multi_day
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TRADES_JSON = PROJECT_ROOT / "outputs" / "backtest" / "600000_2026-07-15_2026-07-22_trades.json"

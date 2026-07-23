@@ -13,12 +13,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from data_provider import fetch_multi_day, fetch_minute_bars
-from backtest_t_strategy import BacktestParams, backtest_single_day
-from t_signal_engine import SignalParams
-from t_risk_guard import RiskParams
-from run_backtest import adapt_params_by_frequency
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from at0.data import fetch_multi_day, fetch_minute_bars
+from at0.backtest import BacktestParams, backtest_single_day
+from at0.strategy import SignalParams
+from at0.risk import RiskParams
+from at0.cli import adapt_params_by_frequency
 
 CODE = "600000"
 START_5MIN = "2026-07-15"

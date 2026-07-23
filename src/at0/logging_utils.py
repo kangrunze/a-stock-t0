@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-L5 T+0 交易日志记录器
+A-T0 交易日志记录器
 =====================
 记录每笔 T 交易的完整明细，供复盘统计胜率、盈亏比、成本覆盖率。
 
@@ -9,9 +8,8 @@ L5 T+0 交易日志记录器
   - state/trades.csv    成交记录（风控通过后记）
   - state/monitor.log   运行日志
 
-独立性：纯日志模块，不依赖 L1/L2/L3/L4。
+独立性：纯日志模块，不依赖其他业务模块。
 """
-
 from __future__ import annotations
 
 import csv
@@ -20,10 +18,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# ═══════════════════════════════════════════════════════════════
-# 路径配置
-# ═══════════════════════════════════════════════════════════════
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# 项目根目录（src/at0/logging_utils.py → src/at0/ → src/ → 项目根）
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 STATE_DIR = PROJECT_ROOT / "state"
 SIGNALS_CSV = STATE_DIR / "signals.csv"
 TRADES_CSV = STATE_DIR / "trades.csv"
@@ -227,9 +223,6 @@ def compute_trade_stats(trades_csv: Path = TRADES_CSV) -> dict:
     }
 
 
-# ═══════════════════════════════════════════════════════════════
-# 自检
-# ═══════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     # 清理旧日志
     for f in [SIGNALS_CSV, TRADES_CSV, MONITOR_LOG]:
@@ -263,8 +256,8 @@ if __name__ == "__main__":
         rules_score=4,
         risk_approved=True,
         risk_checks=["仓位比例✓", "T次数✓", "价差✓", "可用底仓✓", "L1✓", "L2✓"],
-        cost_estimate=12.5,        # 1000×12.50×0.001 = 12.5
-        net_pnl_estimate=137.5,    # 1000×(12.50-12.35) - 12.5 = 137.5
+        cost_estimate=12.5,
+        net_pnl_estimate=137.5,
         bar_time="10:15:00",
         notes="正T卖出 1000 股底仓",
     )
@@ -282,7 +275,7 @@ if __name__ == "__main__":
         risk_approved=True,
         risk_checks=["仓位比例✓", "T次数✓", "价差✓", "L1✓", "L2✓"],
         cost_estimate=12.2,
-        net_pnl_estimate=137.8,    # 1000×(12.35-12.20) - 12.2 = 137.8
+        net_pnl_estimate=137.8,
         bar_time="13:45:00",
         notes="正T买回 1000 股",
     )

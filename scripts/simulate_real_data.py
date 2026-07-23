@@ -20,9 +20,9 @@ import matplotlib.pyplot as plt
 plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from backtest_t_strategy import BacktestParams, backtest_single_day
-from config_loader import load_signal_params, load_risk_params
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from at0.backtest import BacktestParams, backtest_single_day
+from at0.config import load_signal_params, load_risk_params
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_FILE = PROJECT_ROOT / "data" / "sh510300_5min_2026-07-15_2026-07-22.csv"

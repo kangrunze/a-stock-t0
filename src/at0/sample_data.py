@@ -1,6 +1,5 @@
-#!/usr/bin/env python3
 """
-L5 回测样例数据生成器
+A-T0 回测样例数据生成器
 ======================
 生成多种日内形态的合成 1 分钟 K 线数据，用于回测调优。
 
@@ -15,7 +14,6 @@ L5 回测样例数据生成器
 
 每种形态生成 240 根 1 分钟 K 线（A 股全天交易时间）。
 """
-
 from __future__ import annotations
 
 import math
@@ -25,13 +23,11 @@ from typing import Optional
 
 def _gen_time_str(i: int) -> str:
     """根据 K 线索引生成时间字符串（9:31 开始，午休跳过）。"""
-    # 上午 9:31-11:30 = 120 根
     if i < 120:
         total_min = 31 + i
         hh = 9 + total_min // 60
         mm = total_min % 60
     else:
-        # 下午 13:01-15:00 = 120 根
         total_min = (i - 120) + 1
         hh = 13 + total_min // 60
         mm = total_min % 60
@@ -57,8 +53,8 @@ def _make_bar(time_str: str, price: float, volume: int, volatility: float = 0.00
 
 def gen_spike_pullback(
     base_price: float = 10.00,
-    spike_pct: float = 0.03,      # 冲高 3%
-    pullback_pct: float = 0.015,  # 回落 1.5%
+    spike_pct: float = 0.03,
+    pullback_pct: float = 0.015,
     seed: Optional[int] = None,
 ) -> list[dict]:
     """冲高回落：上午冲高，中午前回落。正T 理想场景。"""
@@ -68,18 +64,18 @@ def gen_spike_pullback(
     peak = base_price * (1 + spike_pct)
     end_price = peak * (1 - pullback_pct)
     for i in range(240):
-        if i < 90:  # 9:31-11:00 冲高
+        if i < 90:
             t = i / 90
             p = base_price + (peak - base_price) * t
             vol = 15000 + i * 50
-        elif i < 120:  # 11:01-11:30 高位震荡
+        elif i < 120:
             p = peak + random.uniform(-0.01, 0.01)
             vol = 8000
-        elif i < 180:  # 13:01-14:00 回落
+        elif i < 180:
             t = (i - 120) / 60
             p = peak + (end_price - peak) * t
             vol = 6000
-        else:  # 14:01-15:00 低位震荡
+        else:
             p = end_price + random.uniform(-0.01, 0.01)
             vol = 4000
         bars.append(_make_bar(_gen_time_str(i), p, vol))
@@ -119,7 +115,7 @@ def gen_dip_rally(
 
 def gen_range_bound(
     base_price: float = 10.00,
-    amplitude: float = 0.01,  # 1% 振幅
+    amplitude: float = 0.01,
     seed: Optional[int] = None,
 ) -> list[dict]:
     """横盘震荡。T 难有作为。"""
@@ -127,7 +123,6 @@ def gen_range_bound(
         random.seed(seed)
     bars = []
     for i in range(240):
-        # 正弦波 + 噪声
         p = base_price * (1 + amplitude * math.sin(i * 0.1) + random.uniform(-0.002, 0.002))
         vol = 8000 + random.randint(-2000, 2000)
         bars.append(_make_bar(_gen_time_str(i), p, vol))
@@ -237,7 +232,6 @@ def gen_pattern(pattern: str, base_price: float = 10.00, seed: Optional[int] = N
 
 
 if __name__ == "__main__":
-    # 快速自检：生成所有形态并打印摘要
     for pattern in PATTERN_GENERATORS:
         bars = gen_pattern(pattern, seed=42)
         first = bars[0]

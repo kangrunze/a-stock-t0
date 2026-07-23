@@ -1,35 +1,43 @@
-#!/usr/bin/env python3
 """
-L5 T+0 信号引擎（三层决策层）
-================================
+strategy 层模块 — T+0 信号决策层。
+
+包含 P0-5 三层信号引擎（极值层 / 确认层 / 环境层）：
+  - 极值层（extreme）：VWAP 偏离 / BB / 开盘区间 + KDJ(主触发) + RSI(辅助) + MFI
+  - 确认层（confirm）：缩量企稳 / 量能衰减 / 主动买卖压力
+  - 环境层（filter）：涨跌停封板过滤 + 趋势过滤 + 市场层门控
+
+regime（市场趋势状态：trend_up / trend_down / extreme / range）由 features 层
+的 detect_market_regime 产出，本层仅消费，避免 risk 反向依赖 strategy。
+
+L5 T+0 信号引擎（P0-5 三层决策结构）
+======================================
 特征计算 vs 信号决策两层分离：
   - 特征计算层（intraday_reference.py + stock_quote_features.py）：广算所有指标
-  - 信号决策层（本模块）：只用回测/IC 验证过的子集，按 Layer A/B/C 三层组织
+  - 信号决策层（本模块）：按极值层/确认层/环境层三层组织
 
-Layer A 位置层: VWAP 偏离度 / 日内布林带 / 开盘区间 / EMA
-Layer B 动量层: KDJ(主触发) + RSI(辅助) + MACD/DMI(趋势过滤，不作触发)
-Layer C 量能层: VOL Ratio / 缩量企稳 / MFI + 订单流代理(wb_ratio/内外盘)
+极值层（extreme，≥2项触发）: VWAP偏离 / BB / 开盘区间 + KDJ(主触发) + RSI(辅助) + MFI
+确认层（confirm，≥1项触发）: 缩量企稳 / 量能衰减 / 主动买卖压力
+环境层（filter，必须通过）: 涨跌停封板过滤 + 趋势过滤(P0-6 regime) + 市场层门控
 
-设计原则（避免重蹈"规则堆了一堆但大部分没用"的覆辙）:
+设计原则（避免重蹈"规则堆了一堆但大部分没用"的覆祸）:
   1. 动量超买超卖 5 个指标(RSI/KDJ/CCI/BIAS/ROC)只挑 KDJ 作主触发 + RSI 辅助
   2. MACD/DMI 滞后性高，降级为趋势过滤（判断趋势盘/震荡盘），不作 1 分钟触发
   3. OBV 与 VOL Ratio 方向性重叠，OBV 不进决策层
-  4. 市场层(MarketSnapshot)作为门控：COLD 市场禁加仓
-  5. 盘口特征(quote_feats)作为辅助：订单流代理进入 Layer C
+  4. MFI 属资金超买超卖，归入极值层（P0-5 调整，原在量能层）
+  5. 市场层(MarketSnapshot)作为门控：COLD 市场禁加仓
+  6. 盘口特征(quote_feats)作为辅助：订单流代理进入确认层
 
-触发规则（对齐方案 v0.2 第四节 4.2）:
-  - 减仓信号: 4 项中 ≥3 项满足（3 内容项 + 1 过滤项"未涨停"）
-      项1 VWAP偏离度 ≥ +0.8×ATR_intraday
-      项2 KDJ.K > 80 或 RSI(14) > 70（OR 合并为一项）
-      项3 当前5分钟量能 < 过去20分钟均量×0.8
-      项4 未处于涨停封板状态（过滤项，不满足时硬否决）
-  - 加仓信号: 4 项中 ≥3 项满足（3 内容项 + 1 过滤项"未跌停且题材未退潮"）
-      项1 VWAP偏离度 ≤ -0.8×ATR 或 跌破开盘区间下轨 或 跌破布林带下轨（OR）
-      项2 KDJ.K < 20 或 RSI(14) < 30（OR）
-      项3 连续缩量且不再创新低
-      项4 所属板块未退潮 且 未跌停封板（过滤项，不满足时硬否决）
+触发规则（P0-5 三层结构，对齐方案 v1.1 Phase 3）:
+  - 减仓信号: 极值≥2 + 确认≥1 + 环境通过
+      极值层: 项1 VWAP偏离度≥+0.8×ATR / 项2 KDJ.K>80或RSI>70 / 项2b MFI>80
+      确认层: 项3 5min缩量 或 主动卖占比>0.55
+      环境层: 项4 未涨停封板 + 趋势过滤(extreme否决/trend_up加严)
+  - 加仓信号: 极值≥2 + 确认≥1 + 环境通过
+      极值层: 项1 VWAP偏离≤-0.8×ATR或跌破OR/BB / 项2 KDJ.K<20或RSI<30 / 项2b MFI<20
+      确认层: 项3 连续缩量不创新低 或 主动买占比>0.55
+      环境层: 项4 板块未退潮+未跌停 + 趋势过滤(extreme否决/trend_down加严)
 
-独立性：只依赖 intraday_reference.py 的纯计算函数，不依赖 L1/L2/L3/L4。
+独立性：只依赖 features 层的纯计算函数，不依赖 L1/L2/L3/L4。
 L1/L2 熔断联动由调用方（t_risk_guard）负责，本引擎只产出原始信号。
 """
 
@@ -39,8 +47,13 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional
 
-from intraday_reference import compute_reference_snapshot
-from stock_quote_features import merge_with_reference_snapshot
+from .features import compute_reference_snapshot, detect_market_regime
+from .features import merge_with_reference_snapshot
+from .features import (
+    market_gate_for_add,
+    market_gate_for_reduce,
+    adjust_signal_weight,
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -68,6 +81,9 @@ class SignalParams:
     # Layer B — 趋势过滤（不作触发，仅调整动量层权重）
     trend_filter_enabled: bool = True       # 是否启用 MACD/DMI 趋势过滤
     adx_trend_threshold: float = 25.0       # ADX > 此值视为趋势盘
+    # P0-6: 极端趋势过滤参数
+    adx_extreme_threshold: float = 40.0     # ADX ≥ 此值且价格远离VWAP时为极端趋势
+    extreme_vwap_dev_multiplier: float = 2.0  # |VWAP偏离| ≥ 此值 × ATR相对值 时为极端偏离
 
     # Layer C — 量能层
     vol_ratio_lookback: int = 5             # 量比当前窗口
@@ -80,8 +96,10 @@ class SignalParams:
     active_sell_pressure: float = 0.55      # 主动卖占比 > 此值视为卖压（减仓辅助）
     active_buy_pressure: float = 0.55       # 主动买占比 > 此值视为买盘（加仓辅助）
 
-    # 触发阈值
-    min_rules_to_trigger: int = 3           # 4 项中至少 3 项满足（3 内容项 + 1 过滤项）
+    # 触发阈值（P0-5: 三层结构）
+    min_rules_to_trigger: int = 3           # 总分阈值（向后兼容；实际触发还受 extreme_min/confirm_min 约束）
+    extreme_min: int = 2                    # 极值层至少满足项数
+    confirm_min: int = 1                    # 确认层至少满足项数
 
 
 DEFAULT_PARAMS = SignalParams()
@@ -95,16 +113,29 @@ class TSignal:
     """单个 T 信号。"""
     direction: str                          # "reduce" (减仓) 或 "add" (加仓/买回)
     rules_fired: list[str] = field(default_factory=list)  # 触发的规则描述
-    rules_score: int = 0                    # 触发项数
+    rules_score: int = 0                    # 触发项数（总分 = extreme + confirm + filter）
     price: float = 0.0                      # 信号触发时的价格
     snapshot: dict = field(default_factory=dict)  # 完整指标快照（用于审计）
-    layer_scores: dict = field(default_factory=dict)  # 三层各自触发项数 {content: n, filter: n}
+    layer_scores: dict = field(default_factory=dict)  # 三层各自触发项数 {extreme: n, confirm: n, filter: n}
     market_gate: Optional[dict] = None      # 市场层门控结果 {allowed, reason, weight}
-    trend_context: Optional[str] = None     # 趋势过滤判定 "trend_up"/"trend_down"/"range"
+    trend_context: Optional[str] = None     # 趋势过滤判定 "trend_up"/"trend_down"/"range"/"extreme"
     trigger_threshold: int = 3              # 触发阈值（从 params.min_rules_to_trigger 传入）
+    # P0-5: 三层结构得分与门槛
+    extreme_score: int = 0                  # 极值层触发项数
+    confirm_score: int = 0                  # 确认层触发项数
+    filter_passed: bool = True              # 环境层过滤是否通过
+    extreme_min: int = 2                    # 极值层最少项数
+    confirm_min: int = 1                    # 确认层最少项数
 
     @property
     def triggered(self) -> bool:
+        """P0-5 三层触发条件：环境层通过 + 极值≥extreme_min + 确认≥confirm_min + 总分≥阈值。"""
+        if not self.filter_passed:
+            return False
+        if self.extreme_score < self.extreme_min:
+            return False
+        if self.confirm_score < self.confirm_min:
+            return False
         return self.rules_score >= self.trigger_threshold
 
     @property
@@ -116,42 +147,36 @@ class TSignal:
 
 
 # ═══════════════════════════════════════════════════════════════
-# 趋势过滤判定（MACD/DMI，不作触发，仅判断趋势盘/震荡盘）
+# 趋势过滤判定（P0-6: 委托给 features 层的 detect_market_regime）
 # ═══════════════════════════════════════════════════════════════
 def _judge_trend_context(snap: dict, params: SignalParams) -> str:
     """
-    基于 MACD + DMI 判定当前趋势上下文。
+    判定当前趋势上下文（委托给 features 层的 detect_market_regime）。
+
+    P0-6 整改：regime 检测逻辑归入 features 层（intraday_reference.py），
+    strategy 和 risk 都可读，避免 risk 反向依赖 strategy。
 
     返回:
-      "trend_up"   : MACD 金叉(dif>dea) 且 +DI > -DI 且 ADX > 阈值 → 上升趋势盘
-      "trend_down" : MACD 死叉(dif<dea) 且 -DI > +DI 且 ADX > 阈值 → 下降趋势盘
-      "range"      : 其余（震荡盘或数据不足）
+      "trend_up"   : 上升趋势盘
+      "trend_down" : 下降趋势盘
+      "extreme"    : 极端趋势（ADX极高 + 价格远离VWAP）
+      "range"      : 震荡盘或数据不足
 
-    用途:
-      - trend_up 时，减仓信号更坚决（趋势可能见顶回落），加仓信号更谨慎（不接飞刀）
-      - trend_down 时，加仓信号更谨慎（趋势可能继续下探），减仓信号更坚决
-      - range 时，两层都不加权
+    用途（P0-6 趋势过滤）:
+      - trend_up 时，减仓信号需更高确认（趋势可能继续上行，卖出逆势）
+      - trend_down 时，加仓信号需更高确认（趋势可能继续下探，买入逆势）
+      - extreme 时，暂停所有均值回归（硬否决）
+      - range 时，不调整
     """
     if not params.trend_filter_enabled:
         return "range"
 
-    macd_dif = snap.get("macd_dif")
-    macd_dea = snap.get("macd_dea")
-    pdi = snap.get("pdi")
-    mdi = snap.get("mdi")
-    adx = snap.get("adx")
-
-    if None in (macd_dif, macd_dea, pdi, mdi, adx):
-        return "range"
-
-    if adx < params.adx_trend_threshold:
-        return "range"
-
-    if macd_dif > macd_dea and pdi > mdi:
-        return "trend_up"
-    if macd_dif < macd_dea and mdi > pdi:
-        return "trend_down"
-    return "range"
+    return detect_market_regime(
+        snap,
+        adx_trend_threshold=params.adx_trend_threshold,
+        adx_extreme_threshold=params.adx_extreme_threshold,
+        extreme_vwap_dev_multiplier=params.extreme_vwap_dev_multiplier,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -166,16 +191,17 @@ def evaluate_reduce_signal(
     quote_feats: Optional[dict] = None,
 ) -> TSignal:
     """
-    减仓信号评估。4 项中 ≥3 项触发（对齐方案 v0.2 4.2）:
+    减仓信号评估（P0-5 三层结构）。
 
-    内容项（3项）:
+    极值层（≥2项）:
       项1 VWAP偏离度 ≥ +0.8×ATR_intraday（相对值）
       项2 KDJ.K > 80 或 RSI(14) > 70（OR 合并为一项）
-      项3 当前5分钟量能 < 过去20分钟均量×0.8（缩量冲高）
-    过滤项（1项，不满足时硬否决）:
+      项2b MFI > 80（资金超买）
+    确认层（≥1项）:
+      项3 当前5分钟量能 < 过去20分钟均量×0.8（缩量冲高）或 主动卖占比>0.55（卖压）
+    环境层（必须通过）:
       项4 未处于涨停封板状态
-
-    盘口特征辅助：MFI>80 或 主动卖占比>0.55 可作为项3的替代量能信号。
+      趋势过滤（P0-6：extreme 硬否决，trend_up 逆势加严）
     """
     params = params or DEFAULT_PARAMS
     snap = compute_reference_snapshot(bars, current_price, prev_close)
@@ -185,7 +211,8 @@ def evaluate_reduce_signal(
     snap = merge_with_reference_snapshot(snap, quote_feats)
 
     fired: list[str] = []
-    content_score = 0  # 内容项计分（0-3）
+    extreme_score = 0  # 极值层计分（0-3）
+    confirm_score = 0  # 确认层计分（0-1）
     price = snap["current_price"]
     vwap = snap.get("vwap")
     vwap_dev = snap.get("vwap_dev")
@@ -198,59 +225,67 @@ def evaluate_reduce_signal(
 
     trend_ctx = _judge_trend_context(snap, params)
 
-    # ── 项1: VWAP 偏离度 ≥ +0.8 × ATR_intraday（相对值）──
+    # ── 极值层 项1: VWAP 偏离度 ≥ +0.8 × ATR_intraday（相对值）──
     if vwap and vwap > 0 and atr and atr > 0:
         atr_relative = atr / vwap
         threshold = params.vwap_dev_atr_multiplier * atr_relative
         if vwap_dev is not None and vwap_dev >= threshold:
-            fired.append(f"[项1] VWAP偏离 {vwap_dev*100:+.2f}% ≥ +{params.vwap_dev_atr_multiplier}×ATR({threshold*100:.2f}%)")
-            content_score += 1
+            fired.append(f"[极值1] VWAP偏离 {vwap_dev*100:+.2f}% ≥ +{params.vwap_dev_atr_multiplier}×ATR({threshold*100:.2f}%)")
+            extreme_score += 1
 
-    # ── 项2: KDJ.K > 80 或 RSI(14) > 70（OR 合并）──
+    # ── 极值层 项2: KDJ.K > 80 或 RSI(14) > 70（OR 合并）──
     momentum_fired = False
     if k_val is not None and k_val > params.kdj_overbought:
-        fired.append(f"[项2] KDJ.K={k_val:.1f} > {params.kdj_overbought}")
+        fired.append(f"[极值2] KDJ.K={k_val:.1f} > {params.kdj_overbought}")
         momentum_fired = True
     elif rsi_val is not None and rsi_val > params.rsi_overbought:
-        fired.append(f"[项2] RSI={rsi_val:.1f} > {params.rsi_overbought}")
+        fired.append(f"[极值2] RSI={rsi_val:.1f} > {params.rsi_overbought}")
         momentum_fired = True
     if momentum_fired:
-        content_score += 1
+        extreme_score += 1
 
-    # ── 项3: 当前5分钟量能 < 过去20分钟均量×0.8（缩量冲高）──
-    # 盘口辅助：MFI>80（资金超买）或 主动卖占比>0.55（卖压）可替代
+    # ── 极值层 项2b: MFI > 80（资金超买）──
+    if mfi_val is not None and mfi_val > params.mfi_overbought:
+        fired.append(f"[极值2b] MFI={mfi_val:.1f} > {params.mfi_overbought}（资金超买）")
+        extreme_score += 1
+
+    # ── 确认层 项3: 5min缩量 或 主动卖压 ──
     vol_fired = False
     if recent_5_vol is not None and prior_20_vol_avg is not None and prior_20_vol_avg > 0:
         recent_avg = recent_5_vol / params.vol_ratio_lookback
         shrink_line = prior_20_vol_avg * params.shrink_threshold
         if recent_avg < shrink_line:
-            fired.append(f"[项3] 5min均量 {recent_avg:.0f} < 20min×{params.shrink_threshold}({shrink_line:.0f})")
+            fired.append(f"[确认3] 5min均量 {recent_avg:.0f} < 20min×{params.shrink_threshold}({shrink_line:.0f})")
             vol_fired = True
     if not vol_fired:
-        # 盘口辅助：MFI 超买 或 主动卖压
-        if mfi_val is not None and mfi_val > params.mfi_overbought:
-            fired.append(f"[项3] MFI={mfi_val:.1f} > {params.mfi_overbought}（资金超买）")
+        active_sell = snap.get("active_sell_ratio")
+        if active_sell is not None and active_sell > params.active_sell_pressure:
+            fired.append(f"[确认3] 主动卖占比 {active_sell:.2%} > {params.active_sell_pressure:.0%}（卖压）")
             vol_fired = True
-        else:
-            active_sell = snap.get("active_sell_ratio")
-            if active_sell is not None and active_sell > params.active_sell_pressure:
-                fired.append(f"[项3] 主动卖占比 {active_sell:.2%} > {params.active_sell_pressure:.0%}（卖压）")
-                vol_fired = True
     if vol_fired:
-        content_score += 1
+        confirm_score += 1
 
-    # ── 项4: 未涨停封板（过滤项，硬否决）──
+    # ── 环境层 项4: 未涨停封板（过滤项，硬否决）──
     filter_passed = not is_limit_up_locked
     if filter_passed:
-        fired.append("[项4] 未涨停封板（可成交）")
+        fired.append("[环境4] 未涨停封板（可成交）")
     else:
-        fired.append("[项4] 涨停封板（硬否决）")
+        fired.append("[环境4] 涨停封板（硬否决）")
 
-    # 计分：4项中≥3项 = 内容分 + 过滤分(1) ≥ 3
-    # 涨停封板时硬否决（content_score 归零）
-    total_score = content_score + (1 if filter_passed else 0)
+    # 计分：总分 = 极值 + 确认 + 过滤
+    total_score = extreme_score + confirm_score + (1 if filter_passed else 0)
     if not filter_passed:
         total_score = 0
+
+    # P0-6: 趋势过滤 — 强趋势中抑制逆势均值回归
+    trigger_threshold = params.min_rules_to_trigger
+    if trend_ctx == "extreme":
+        total_score = 0
+        filter_passed = False
+        fired.append("[环境] 极端趋势，暂停均值回归卖出（硬否决）")
+    elif trend_ctx == "trend_up":
+        trigger_threshold += 1
+        fired.append(f"[环境] 上升趋势，减仓需 {trigger_threshold} 项确认（逆势加严）")
 
     return TSignal(
         direction="reduce",
@@ -258,9 +293,14 @@ def evaluate_reduce_signal(
         rules_score=total_score,
         price=price,
         snapshot=snap,
-        layer_scores={"content": content_score, "filter": 1 if filter_passed else 0},
+        layer_scores={"extreme": extreme_score, "confirm": confirm_score, "filter": 1 if filter_passed else 0},
         trend_context=trend_ctx,
-        trigger_threshold=params.min_rules_to_trigger,
+        trigger_threshold=trigger_threshold,
+        extreme_score=extreme_score,
+        confirm_score=confirm_score,
+        filter_passed=filter_passed,
+        extreme_min=params.extreme_min,
+        confirm_min=params.confirm_min,
     )
 
 
@@ -277,16 +317,17 @@ def evaluate_add_signal(
     quote_feats: Optional[dict] = None,
 ) -> TSignal:
     """
-    加仓/买回信号评估。4 项中 ≥3 项触发（对齐方案 v0.2 4.2）:
+    加仓/买回信号评估（P0-5 三层结构）。
 
-    内容项（3项）:
+    极值层（≥2项）:
       项1 VWAP偏离度 ≤ -0.8×ATR 或 跌破开盘区间下轨 或 跌破布林带下轨（OR）
       项2 KDJ.K < 20 或 RSI(14) < 30（OR 合并为一项）
-      项3 连续缩量且不再创新低（地量企稳）
-    过滤项（1项，不满足时硬否决）:
+      项2b MFI < 20（资金超卖）
+    确认层（≥1项）:
+      项3 连续缩量且不再创新低（地量企稳）或 主动买占比>0.55（买盘）
+    环境层（必须通过）:
       项4 所属板块未退潮 且 未跌停封板
-
-    盘口特征辅助：MFI<20 或 主动买占比>0.55 可作为项3的替代量能信号。
+      趋势过滤（P0-6：extreme 硬否决，trend_down 不接飞刀加严）
     """
     params = params or DEFAULT_PARAMS
     snap = compute_reference_snapshot(bars, current_price, prev_close)
@@ -296,7 +337,8 @@ def evaluate_add_signal(
     snap = merge_with_reference_snapshot(snap, quote_feats)
 
     fired: list[str] = []
-    content_score = 0
+    extreme_score = 0
+    confirm_score = 0
     price = snap["current_price"]
     vwap = snap.get("vwap")
     vwap_dev = snap.get("vwap_dev")
@@ -310,67 +352,77 @@ def evaluate_add_signal(
 
     trend_ctx = _judge_trend_context(snap, params)
 
-    # ── 项1: VWAP偏离度 ≤ -0.8×ATR 或 跌破开盘区间下轨 或 跌破布林带下轨（OR）──
+    # ── 极值层 项1: VWAP偏离度 ≤ -0.8×ATR 或 跌破开盘区间下轨 或 跌破布林带下轨（OR）──
     pos_fired = False
     if vwap and vwap > 0 and atr and atr > 0 and vwap_dev is not None:
         atr_relative = atr / vwap
         threshold = -params.vwap_dev_atr_multiplier * atr_relative
         if vwap_dev <= threshold:
-            fired.append(f"[项1] VWAP偏离 {vwap_dev*100:+.2f}% ≤ {threshold*100:.2f}%")
+            fired.append(f"[极值1] VWAP偏离 {vwap_dev*100:+.2f}% ≤ {threshold*100:.2f}%")
             pos_fired = True
     if not pos_fired and or_low is not None and price < or_low:
-        fired.append(f"[项1] 价格 {price} < 开盘区间下轨 {or_low}")
+        fired.append(f"[极值1] 价格 {price} < 开盘区间下轨 {or_low}")
         pos_fired = True
     if not pos_fired and bb_lower is not None and price < bb_lower:
-        fired.append(f"[项1] 价格 {price} < 布林带下轨 {bb_lower:.2f}")
+        fired.append(f"[极值1] 价格 {price} < 布林带下轨 {bb_lower:.2f}")
         pos_fired = True
     if pos_fired:
-        content_score += 1
+        extreme_score += 1
 
-    # ── 项2: KDJ.K < 20 或 RSI(14) < 30（OR 合并）──
+    # ── 极值层 项2: KDJ.K < 20 或 RSI(14) < 30（OR 合并）──
     momentum_fired = False
     if k_val is not None and k_val < params.kdj_oversold:
-        fired.append(f"[项2] KDJ.K={k_val:.1f} < {params.kdj_oversold}")
+        fired.append(f"[极值2] KDJ.K={k_val:.1f} < {params.kdj_oversold}")
         momentum_fired = True
     elif rsi_val is not None and rsi_val < params.rsi_oversold:
-        fired.append(f"[项2] RSI={rsi_val:.1f} < {params.rsi_oversold}")
+        fired.append(f"[极值2] RSI={rsi_val:.1f} < {params.rsi_oversold}")
         momentum_fired = True
     if momentum_fired:
-        content_score += 1
+        extreme_score += 1
 
-    # ── 项3: 连续缩量且不再创新低（地量企稳）──
-    # 盘口辅助：MFI<20（资金超卖）或 主动买占比>0.55（买盘）可替代
+    # ── 极值层 项2b: MFI < 20（资金超卖）──
+    if mfi_val is not None and mfi_val < params.mfi_oversold:
+        fired.append(f"[极值2b] MFI={mfi_val:.1f} < {params.mfi_oversold}（资金超卖）")
+        extreme_score += 1
+
+    # ── 确认层 项3: 连续缩量且不再创新低 或 主动买盘 ──
     vol_fired = False
     if consecutive_shrink:
-        fired.append("[项3] 连续缩量且不再创新低（地量企稳）")
+        fired.append("[确认3] 连续缩量且不再创新低（地量企稳）")
         vol_fired = True
     if not vol_fired:
-        if mfi_val is not None and mfi_val < params.mfi_oversold:
-            fired.append(f"[项3] MFI={mfi_val:.1f} < {params.mfi_oversold}（资金超卖）")
+        active_buy = snap.get("active_buy_ratio")
+        if active_buy is not None and active_buy > params.active_buy_pressure:
+            fired.append(f"[确认3] 主动买占比 {active_buy:.2%} > {params.active_buy_pressure:.0%}（买盘）")
             vol_fired = True
-        else:
-            active_buy = snap.get("active_buy_ratio")
-            if active_buy is not None and active_buy > params.active_buy_pressure:
-                fired.append(f"[项3] 主动买占比 {active_buy:.2%} > {params.active_buy_pressure:.0%}（买盘）")
-                vol_fired = True
     if vol_fired:
-        content_score += 1
+        confirm_score += 1
 
-    # ── 项4: 所属板块未退潮 且 未跌停封板（过滤项，硬否决）──
+    # ── 环境层 项4: 所属板块未退潮 且 未跌停封板（过滤项，硬否决）──
     filter_passed = (not theme_retreated) and (not is_limit_down_locked)
     if filter_passed:
-        fired.append("[项4] 板块未退潮且未跌停封板（可成交）")
+        fired.append("[环境4] 板块未退潮且未跌停封板（可成交）")
     else:
         reason = []
         if theme_retreated:
             reason.append("板块退潮")
         if is_limit_down_locked:
             reason.append("跌停封板")
-        fired.append(f"[项4] {'+'.join(reason)}（硬否决）")
+        fired.append(f"[环境4] {'+'.join(reason)}（硬否决）")
 
-    total_score = content_score + (1 if filter_passed else 0)
+    total_score = extreme_score + confirm_score + (1 if filter_passed else 0)
     if not filter_passed:
         total_score = 0
+
+    # P0-6: 趋势过滤 — 强趋势中抑制逆势均值回归
+    trigger_threshold = params.min_rules_to_trigger
+    if trend_ctx == "extreme":
+        total_score = 0
+        filter_passed = False
+        fired.append("[环境] 极端趋势，暂停均值回归买入（硬否决）")
+    elif trend_ctx == "trend_down":
+        trigger_threshold += 1
+        fired.append(f"[环境] 下降趋势，加仓需 {trigger_threshold} 项确认（不接飞刀）")
 
     return TSignal(
         direction="add",
@@ -378,9 +430,14 @@ def evaluate_add_signal(
         rules_score=total_score,
         price=price,
         snapshot=snap,
-        layer_scores={"content": content_score, "filter": 1 if filter_passed else 0},
+        layer_scores={"extreme": extreme_score, "confirm": confirm_score, "filter": 1 if filter_passed else 0},
         trend_context=trend_ctx,
-        trigger_threshold=params.min_rules_to_trigger,
+        trigger_threshold=trigger_threshold,
+        extreme_score=extreme_score,
+        confirm_score=confirm_score,
+        filter_passed=filter_passed,
+        extreme_min=params.extreme_min,
+        confirm_min=params.confirm_min,
     )
 
 
@@ -450,35 +507,31 @@ def evaluate_all_signals(
     market_gate_add = None
     market_gate_reduce = None
     if market is not None:
-        try:
-            from market_layer import market_gate_for_add, market_gate_for_reduce, adjust_signal_weight
-            market_gate_add = {
-                "allowed": market_gate_for_add(market)[0],
-                "reason": market_gate_for_add(market)[1],
-            }
-            market_gate_reduce = {
-                "allowed": market_gate_for_reduce(market)[0],
-                "reason": market_gate_for_reduce(market)[1],
-            }
-            # P1-1: 市场情绪加权 → 动态调整触发阈值
-            # 权重 > 1.0 放宽触发（降低阈值），权重 < 1.0 收紧触发（提高阈值）
-            reduce_weight = adjust_signal_weight(market, "reduce")
-            add_weight = adjust_signal_weight(market, "add")
-            reduce_sig.trigger_threshold = _apply_weight_to_threshold(
-                params.min_rules_to_trigger, reduce_weight
-            )
-            add_sig.trigger_threshold = _apply_weight_to_threshold(
-                params.min_rules_to_trigger, add_weight
-            )
-            market_gate_add["weight"] = add_weight
-            market_gate_add["adjusted_threshold"] = add_sig.trigger_threshold
-            market_gate_reduce["weight"] = reduce_weight
-            market_gate_reduce["adjusted_threshold"] = reduce_sig.trigger_threshold
-            # 把门控结果写入信号
-            reduce_sig.market_gate = market_gate_reduce
-            add_sig.market_gate = market_gate_add
-        except ImportError:
-            pass  # market_layer 不可用时跳过门控
+        market_gate_add = {
+            "allowed": market_gate_for_add(market)[0],
+            "reason": market_gate_for_add(market)[1],
+        }
+        market_gate_reduce = {
+            "allowed": market_gate_for_reduce(market)[0],
+            "reason": market_gate_for_reduce(market)[1],
+        }
+        # P1-1: 市场情绪加权 → 动态调整触发阈值
+        # 权重 > 1.0 放宽触发（降低阈值），权重 < 1.0 收紧触发（提高阈值）
+        reduce_weight = adjust_signal_weight(market, "reduce")
+        add_weight = adjust_signal_weight(market, "add")
+        reduce_sig.trigger_threshold = _apply_weight_to_threshold(
+            params.min_rules_to_trigger, reduce_weight
+        )
+        add_sig.trigger_threshold = _apply_weight_to_threshold(
+            params.min_rules_to_trigger, add_weight
+        )
+        market_gate_add["weight"] = add_weight
+        market_gate_add["adjusted_threshold"] = add_sig.trigger_threshold
+        market_gate_reduce["weight"] = reduce_weight
+        market_gate_reduce["adjusted_threshold"] = reduce_sig.trigger_threshold
+        # 把门控结果写入信号
+        reduce_sig.market_gate = market_gate_reduce
+        add_sig.market_gate = market_gate_add
 
     recommendation = "none"
     reduce_triggered = reduce_sig.triggered

@@ -31,12 +31,34 @@ signal:
   min_rules_to_trigger: 3           # 4 项中至少 3 项满足
 
 # ── 风控参数（t_risk_guard.RiskParams）──
+# P0-1 整改：round_trip_cost 从 0.1% 修正为真实 0.3%（佣金×2+印花税+滑点×2）
+# max_t_size_ratio 从 0.5 收紧至 0.25（方案 v1.0 Section 5 Phase 1 研究起点）
 risk:
-  max_t_size_ratio: 0.5             # 单次T仓位比例上限（底仓的 50%）
+  max_t_size_ratio: 0.25            # 单次T仓位比例上限（底仓的 25%）
   max_t_trades_per_day: 4           # 每日最大T次数
-  min_capture_spread: 0.006         # 最小预期捕获空间（0.6%，方案 v0.2 起始值）
-  round_trip_cost: 0.001            # 来回成本（0.1%）
+  min_capture_spread: 0.0075        # 最小预期捕获空间（0.75%，扣除0.3%成本后净0.45%）
+  round_trip_cost: 0.003            # 来回成本（0.3% = 佣金万2.5×2 + 印花税0.05% + 滑点0.1%×2）
+  min_net_expected_return: 0.0045   # 最小净期望收益（0.45%，扣除成本后）
   eod_check_time: "14:50"           # 尾盘平衡检查时间
+
+# ── 统一成本模型（cost_model.CostModel）──
+# P0-1 整改：成本计算统一收敛到 CostModel，支持三种场景
+cost:
+  commission_rate: 0.00025          # 佣金（万2.5，单边）
+  stamp_tax_rate: 0.0005            # 印花税（0.05%，卖出单边）
+  slippage_rate: 0.001              # 滑点（0.1%，单边）
+  impact_rate: 0.0000               # 冲击成本（小单忽略）
+  scenario: base                    # optimistic / base / pessimistic
+
+# ── 敞口策略（exposure_policy.ExposurePolicy）──
+# P0-3 整改：尾盘时段限制与交易生命周期
+exposure_policy:
+  max_open_legs_per_direction: 1    # 每方向最多未配对腿数
+  max_holding_bars: 12              # 单笔最大持仓K线数，超过标记expired
+  no_new_after_bar_ratio: 0.83      # 14:20后禁止新建风险腿
+  exit_only_after_bar_ratio: 0.92   # 14:40后只允许退出
+  eod_check_bar_ratio: 0.96         # 14:50尾盘检查
+  require_opposite_direction: true  # 有未配对腿时只允许反方向
 
 # ── 市场层情绪分级阈值（market_layer.MarketSnapshot）──
 market:
@@ -52,9 +74,11 @@ screener:
   min_capture_spread: 0.006         # 单笔预期捕获空间 ≥ 0.6%
 
 # ── 回测参数（backtest_t_strategy.BacktestParams）──
+# P0 整改：成本字段保留兼容，实际成本计算委托给 CostModel（见 cost 段）
 backtest:
-  commission_rate: 0.00025          # 佣金费率（万2.5）
-  stamp_tax_rate: 0.0005            # 印花税（0.05%，卖出单边）
-  slippage: 0.001                   # 滑点（0.1%）
+  commission_rate: 0.00025          # 佣金费率（万2.5）— 兼容字段，实际用 cost 段
+  stamp_tax_rate: 0.0005            # 印花税（0.05%，卖出单边）— 兼容字段
+  slippage: 0.001                   # 滑点（0.1%）— 兼容字段
   cooldown_bars: 3                  # 信号触发后N根K线内不再触发同方向信号
   require_opposite_direction: true  # 有未配对腿时只允许反方向信号
+  max_holding_bars: 12              # P0-2: 单笔最大持仓K线数
