@@ -35,14 +35,16 @@ def extract_trades(result: dict) -> list[dict]:
     return trades
 
 
-def summarize_one(code: str, trades: list[dict]) -> dict:
-    """单只股票汇总。"""
+def summarize_one(code: str, result: dict) -> dict:
+    """单只股票汇总（P3-1: 含跨日配对+未配对敞口浮盈浮亏）。"""
+    trades = extract_trades(result)
     paired = [t for t in trades if t.get("paired")]
     wins = [t for t in paired if t.get("pnl", 0) > 0]
     losses = [t for t in paired if t.get("pnl", 0) < 0]
-    # pnl=毛利（配对价差），cost=每笔手续费；净盈亏 = sum(pnl) - sum(cost)
     gross_pnl = sum(t.get("pnl", 0) for t in trades)
     total_cost = sum(t.get("cost", 0) for t in trades)
+    unrealized = result.get("unrealized_pnl", 0.0)
+    final_legs = result.get("final_open_legs_count", 0)
     return {
         "code": code,
         "total_trades": len(trades),
@@ -54,6 +56,9 @@ def summarize_one(code: str, trades: list[dict]) -> dict:
         "gross_pnl": round(gross_pnl, 2),
         "total_cost": round(total_cost, 2),
         "net_pnl": round(gross_pnl - total_cost, 2),
+        "unrealized_pnl": round(unrealized, 2),  # P3-1: 未配对敞口浮盈浮亏
+        "net_pnl_with_unrealized": round(gross_pnl - total_cost + unrealized, 2),  # P3-1: 含浮盈浮亏
+        "final_open_legs_count": final_legs,  # P3-1: 回测结束未配对腿数
     }
 
 
@@ -116,7 +121,7 @@ def main():
             continue
 
         trades = extract_trades(result)
-        summary = summarize_one(code, trades)
+        summary = summarize_one(code, result)
         per_stock.append(summary)
         all_trades_count += len(trades)
 
@@ -124,7 +129,9 @@ def main():
         print(f"{prefix}  交易={summary['total_trades']:2d} "
               f"配对={summary['paired_trades']:2d} "
               f"胜率={wr:>5s} "
-              f"净盈亏={summary['net_pnl']:+8.2f}")
+              f"净盈亏={summary['net_pnl']:+8.2f} "
+              f"浮盈={summary['unrealized_pnl']:+8.2f} "
+              f"未配对腿={summary['final_open_legs_count']}")
 
     # ── 整体汇总 ──
     total_paired = sum(s.get("paired_trades", 0) for s in per_stock)
@@ -132,26 +139,31 @@ def main():
     total_net = sum(s.get("net_pnl", 0) for s in per_stock)
     total_gross = sum(s.get("gross_pnl", 0) for s in per_stock)
     total_cost = sum(s.get("total_cost", 0) for s in per_stock)
+    total_unrealized = sum(s.get("unrealized_pnl", 0) for s in per_stock)
+    total_final_legs = sum(s.get("final_open_legs_count", 0) for s in per_stock)
     overall_wr = (total_wins / total_paired) if total_paired else 0.0
 
     print("\n" + "=" * 70)
     print("整体汇总")
     print("=" * 70)
-    print(f"  股票数:     {len(per_stock)}")
-    print(f"  总交易笔数: {all_trades_count}")
-    print(f"  配对笔数:   {total_paired}")
-    print(f"  盈利笔数:   {total_wins}")
-    print(f"  整体胜率:   {overall_wr*100:.1f}%")
-    print(f"  毛利润:     {total_gross:+.2f}")
-    print(f"  总成本:     {total_cost:.2f}")
-    print(f"  净盈亏:     {total_net:+.2f}")
+    print(f"  股票数:          {len(per_stock)}")
+    print(f"  总交易笔数:      {all_trades_count}")
+    print(f"  配对笔数:        {total_paired} ({total_paired/all_trades_count*100:.1f}%)" if all_trades_count else "  配对笔数: 0")
+    print(f"  盈利笔数:        {total_wins}")
+    print(f"  整体胜率:        {overall_wr*100:.1f}%")
+    print(f"  毛利润:          {total_gross:+.2f}")
+    print(f"  总成本:          {total_cost:.2f}")
+    print(f"  净盈亏(已实现):  {total_net:+.2f}")
+    print(f"  未配对浮盈浮亏:  {total_unrealized:+.2f}")
+    print(f"  净盈亏(含浮盈):  {total_net + total_unrealized:+.2f}")
+    print(f"  回测结束未配对腿: {total_final_legs}")
 
     # 按股票拆分
     print("\n" + "-" * 70)
-    print("按股票拆分（按净盈亏降序）")
+    print("按股票拆分（按含浮盈净盈亏降序）")
     print("-" * 70)
     sorted_by_pnl = sorted(per_stock,
-                           key=lambda x: x.get("net_pnl", 0), reverse=True)
+                           key=lambda x: x.get("net_pnl_with_unrealized", x.get("net_pnl", 0)), reverse=True)
     for s in sorted_by_pnl:
         if "error" in s:
             print(f"  {s['code']:12s}  ERROR: {s['error']}")
@@ -159,20 +171,16 @@ def main():
         wr = f"{s['win_rate']*100:.1f}%" if s['paired_trades'] else "  N/A"
         print(f"  {s['code']:12s}  交易={s['total_trades']:2d}  "
               f"配对={s['paired_trades']:2d}  胜率={wr:>5s}  "
-              f"净盈亏={s['net_pnl']:+8.2f}")
+              f"已实现={s['net_pnl']:+8.2f}  浮盈={s['unrealized_pnl']:+8.2f}  "
+              f"含浮盈={s['net_pnl_with_unrealized']:+8.2f}  未配对={s['final_open_legs_count']}")
 
-    # 盈利集中度
+    # 盈利集中度（按含浮盈口径）
     profitable = [s for s in per_stock
-                  if "error" not in s and s.get("net_pnl", 0) > 0]
+                  if "error" not in s and s.get("net_pnl_with_unrealized", s.get("net_pnl", 0)) > 0]
     losing = [s for s in per_stock
-              if "error" not in s and s.get("net_pnl", 0) < 0]
-    print(f"\n  盈利股票: {len(profitable)} 只, 合计 {sum(s['net_pnl'] for s in profitable):+.2f}")
-    print(f"  亏损股票: {len(losing)} 只, 合计 {sum(s['net_pnl'] for s in losing):+.2f}")
-    if profitable:
-        top3 = sorted(profitable, key=lambda x: x['net_pnl'], reverse=True)[:3]
-        top3_sum = sum(s['net_pnl'] for s in top3)
-        print(f"  盈利前3名合计: {top3_sum:+.2f} "
-              f"(占整体净盈亏的 {top3_sum/total_net*100:.0f}%)" if total_net else "")
+              if "error" not in s and s.get("net_pnl_with_unrealized", s.get("net_pnl", 0)) < 0]
+    print(f"\n  盈利股票: {len(profitable)} 只, 合计 {sum(s['net_pnl_with_unrealized'] for s in profitable):+.2f}")
+    print(f"  亏损股票: {len(losing)} 只, 合计 {sum(s['net_pnl_with_unrealized'] for s in losing):+.2f}")
 
     # 落盘
     SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +199,9 @@ def main():
                 "gross_pnl": round(total_gross, 2),
                 "total_cost": round(total_cost, 2),
                 "net_pnl": round(total_net, 2),
+                "unrealized_pnl": round(total_unrealized, 2),
+                "net_pnl_with_unrealized": round(total_net + total_unrealized, 2),
+                "final_open_legs_count": total_final_legs,
                 "profitable_stocks": len(profitable),
                 "losing_stocks": len(losing),
             },

@@ -172,6 +172,7 @@ def evaluate_param_set_real(
 ) -> dict:
     """
     用真实数据在指定日期集合上评估一组参数。
+    P3-1: 使用含浮盈浮亏的净盈亏(net_pnl_with_unrealized)作为排名指标。
 
     :param target_dates: 只回测这些日期（用于训练/验证集切分）
     """
@@ -182,6 +183,8 @@ def evaluate_param_set_real(
     total_trades = 0
     total_paired = 0
     total_wins = 0
+    total_unrealized = 0.0  # P3-1: 未配对敞口浮盈浮亏
+    total_final_legs = 0
 
     for code, data in real_data.items():
         # 按目标日期过滤
@@ -224,15 +227,22 @@ def evaluate_param_set_real(
                         total_wins += 1
                 total_gross += t.get("pnl", 0)
 
+        # P3-1: 累计未配对敞口浮盈浮亏
+        total_unrealized += result.get("unrealized_pnl", 0.0)
+        total_final_legs += result.get("final_open_legs_count", 0)
+
     net_pnl = total_gross - total_cost
     return {
-        "total_net_pnl": round(net_pnl, 2),
+        "total_net_pnl": round(net_pnl + total_unrealized, 2),  # P3-1: 改用含浮盈口径排名
+        "realized_net_pnl": round(net_pnl, 2),  # 已实现（不含浮盈）
+        "unrealized_pnl": round(total_unrealized, 2),
         "gross_pnl": round(total_gross, 2),
         "total_cost": round(total_cost, 2),
         "total_trades": total_trades,
         "paired_trades": total_paired,
         "win_trades": total_wins,
         "win_rate": round(total_wins / total_paired, 4) if total_paired else 0.0,
+        "final_open_legs_count": total_final_legs,
         "insufficient_sample": total_trades < MIN_TRADES_THRESHOLD,
     }
 

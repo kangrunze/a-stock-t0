@@ -144,6 +144,7 @@ def backtest_single_day(
     params: Optional[BacktestParams] = None,
     l1_systemic_risk: bool = False,
     theme_retreated: bool = False,
+    initial_open_legs: Optional[list[dict]] = None,
 ) -> dict:
     """
     对单只股票单日进行分钟级回测。
@@ -156,6 +157,7 @@ def backtest_single_day(
       params: 回测参数
       l1_systemic_risk: 模拟 L1 系统性风险日（仅允许减仓）
       theme_retreated: 模拟 L2 题材退潮（禁止加仓/买回）
+      initial_open_legs: 跨日延续的未配对腿（P3-1: 跨日连续配对）
 
     返回:
     {
@@ -169,6 +171,8 @@ def backtest_single_day(
         "win_rate": float,             # 胜率
         "trades": list[dict],          # 成交明细
         "eod_status": str,             # 尾盘状态
+        "final_open_legs": list[dict], # P3-1: 日终未配对腿（传给下一日）
+        "last_close": float,           # P3-1: 当日收盘价（用于未配对敞口估值）
     }
     """
     params = params or BacktestParams()
@@ -176,6 +180,9 @@ def backtest_single_day(
         base_shares=params.base_shares,
         avg_cost=params.avg_cost,
     )
+    # P3-1: 跨日延续未配对腿（FIFO 配对队列不按日重置）
+    if initial_open_legs:
+        state.open_legs = [dict(leg) for leg in initial_open_legs]  # 深拷贝避免污染上游
 
     if len(bars) < params.warmup_bars:
         return {
@@ -189,6 +196,8 @@ def backtest_single_day(
             "win_rate": 0.0,
             "trades": [],
             "eod_status": "insufficient_bars",
+            "final_open_legs": state.open_legs,  # P3-1: 仍传递跨日腿
+            "last_close": prev_close,
         }
 
     # 计算涨跌停价
@@ -285,6 +294,9 @@ def backtest_single_day(
     win_count = sum(1 for t in state.trades if t.get("pnl", 0) > 0)
     win_rate = win_count / len(state.trades) if state.trades else 0.0
 
+    # P3-1: 当日收盘价（用于未配对敞口估值）
+    last_close = bars[-1]["close"] if bars else prev_close
+
     return {
         "code": code,
         "date": trading_date,
@@ -298,6 +310,8 @@ def backtest_single_day(
         "eod_status": "balanced" if state.net_position_delta == 0 else (
             "net_reduce" if state.net_position_delta < 0 else "net_add"
         ),
+        "final_open_legs": state.open_legs,  # P3-1: 日终未配对腿（传给下一日）
+        "last_close": last_close,
     }
 
 
@@ -436,18 +450,23 @@ def backtest_multi_day(
     """
     对单只股票多个交易日进行回测。
 
-    每日独立回测（不复用前一日 T 状态，因为 T+1 已解锁）。
-    最终汇总统计。
+    P3-1: FIFO 配对队列 open_legs 跨日连续，不再按日重置。
+    日内状态（locked_shares/t_trades_today/last_signal_bar）仍每日重置
+    （T+1 解锁的是 locked_shares，与 open_legs 无关）。
+    回测结束时对仍未配对的 open_legs 按最后收盘价计算浮盈浮亏。
 
     返回:
     {
         "code": str,
         "total_days": int,
         "total_trades": int,
-        "total_cost_reduction": float,
-        "total_cost_paid": float,
-        "net_pnl": float,
-        "win_rate": float,
+        "total_cost_reduction": float,    # 已实现配对盈亏
+        "total_cost_paid": float,         # 总交易成本
+        "net_pnl": float,                 # 净盈亏 = 已实现 - 成本
+        "unrealized_pnl": float,          # P3-1: 未配对敞口浮盈浮亏
+        "net_pnl_with_unrealized": float, # P3-1: 含浮盈浮亏的净盈亏
+        "final_open_legs_count": int,     # P3-1: 回测结束未配对腿数
+        "win_rate": float,                # 基于已配对交易
         "avg_trades_per_day": float,
         "daily_results": list[dict],
     }
@@ -461,6 +480,8 @@ def backtest_multi_day(
     total_cost_reduction = 0.0
     total_cost_paid = 0.0
     total_win = 0
+    carry_open_legs: list[dict] = []  # P3-1: 跨日延续的未配对腿
+    last_close = 0.0
 
     for date_str in sorted(daily_bars.keys()):
         bars = daily_bars[date_str]
@@ -476,21 +497,38 @@ def backtest_multi_day(
             params=params,
             l1_systemic_risk=date_str in l1_risk_dates,
             theme_retreated=date_str in retreated_dates,
+            initial_open_legs=carry_open_legs,  # P3-1: 传入跨日腿
         )
         daily_results.append(result)
         total_trades += result["t_trades"]
         total_cost_reduction += result["cost_reduction"]
         total_cost_paid += result["total_cost_paid"]
         total_win += sum(1 for t in result["trades"] if t.get("pnl", 0) > 0)
+        carry_open_legs = result.get("final_open_legs", [])
+        last_close = result.get("last_close", prev_close)
+
+    # P3-1: 回测结束时对未配对敞口按最后收盘价计算浮盈浮亏
+    # 买入腿（反T先买）：浮盈 = (最后收盘价 - 买入价) × 股数
+    # 卖出腿（正T先卖）：浮盈 = (卖出价 - 最后收盘价) × 股数（卖出了，需要买回）
+    unrealized_pnl = 0.0
+    for leg in carry_open_legs:
+        if leg["direction"] == "buy":
+            unrealized_pnl += (last_close - leg["fill_price"]) * leg["shares"]
+        else:  # sell
+            unrealized_pnl += (leg["fill_price"] - last_close) * leg["shares"]
 
     win_rate = total_win / total_trades if total_trades > 0 else 0.0
+    net_pnl = total_cost_reduction - total_cost_paid
     return {
         "code": code,
         "total_days": len(daily_results),
         "total_trades": total_trades,
         "total_cost_reduction": total_cost_reduction,
         "total_cost_paid": total_cost_paid,
-        "net_pnl": total_cost_reduction - total_cost_paid,
+        "net_pnl": net_pnl,
+        "unrealized_pnl": round(unrealized_pnl, 2),  # P3-1: 未配对敞口浮盈浮亏
+        "net_pnl_with_unrealized": round(net_pnl + unrealized_pnl, 2),  # P3-1: 含浮盈浮亏
+        "final_open_legs_count": len(carry_open_legs),  # P3-1: 回测结束未配对腿数
         "win_rate": win_rate,
         "avg_trades_per_day": total_trades / len(daily_results) if daily_results else 0,
         "daily_results": daily_results,

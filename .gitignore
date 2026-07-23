@@ -1,0 +1,4 @@
+outputs/backtest/600026_2026-06-22_2026-07-22_report.json
+outputs/*
+outputs/backtest/*.json
+scripts/__pycache__/*.pyc
