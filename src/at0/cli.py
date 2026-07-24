@@ -101,15 +101,27 @@ def adapt_params_by_frequency(
     """
     5 分钟线一天 48 根，1 分钟线一天 240 根。
     warmup_bars / eod_check_bar_idx 原按 1 分钟(240根)设计，需按比例缩放。
+
+    P0-5 整改（2026-07-24）：max_holding_bars 同步按频率缩放。
+    旧实现 max_holding_bars 恒为 12，1min 数据下仅 12 分钟持仓上限，腿频繁
+    expired；5min 数据下 12 根 = 60 分钟，合理。改为按"等价时长"对齐：
+      - 5min: max_holding_bars=12（60 分钟）
+      - 1min: max_holding_bars=60（60 分钟，与 5min 等价）
+    同时同步更新 exposure_policy.max_holding_bars（approve_signal 用它判 expired）。
     """
     if frequency == "5min":
         # 预热 30 分钟: 1分钟用30根 → 5分钟用6根
         params.warmup_bars = min(6, max(3, bars_per_day // 8))
         # 14:50 约对应 5分钟线第 33 根（9:35起，上午23根+下午10根）
         params.eod_check_bar_idx = min(33, bars_per_day - 2)
+        params.max_holding_bars = 12   # 5min: 60 分钟
     else:  # 1min
         params.warmup_bars = 30
         params.eod_check_bar_idx = 200
+        params.max_holding_bars = 60   # 1min: 60 分钟（与 5min 等价时长）
+    # 同步 exposure_policy（若已构造），保持 max_holding_bars 一致
+    if params.exposure_policy is not None:
+        params.exposure_policy.max_holding_bars = params.max_holding_bars
     return params
 
 
@@ -575,6 +587,7 @@ def monitor_single_stock(
     market: MarketSnapshot = None,
     signal_params: SignalParams = None,
     risk_params: RiskParams = None,
+    cost_model=None,
     source: str = "auto",
     trading_date: str = None,
 ) -> dict:
@@ -585,13 +598,16 @@ def monitor_single_stock(
       market: 市场层快照（可选），COLD 市场禁加仓。由 main() 每轮统一计算后传入。
       signal_params: 信号参数（来自 config_loader.load_signal_params()）
       risk_params: 风控参数（来自 config_loader.load_risk_params()）
+      cost_model: 统一成本模型（来自 config_loader.load_cost_model()，P0-4）
       source: 数据源 'auto'|'mootdx'|'westock'|'baostock'（统一走 data_provider）
       trading_date: 'YYYY-MM-DD'，None=实时（今日），指定日期=历史回放
 
     返回监控结果 dict。
     """
+    from .risk import CostModel
     signal_params = signal_params or SignalParams()
     risk_params = risk_params or RiskParams()
+    cost_model = cost_model or CostModel.base()
     today = datetime.now().strftime("%Y-%m-%d")
     trading_date = trading_date or today
     is_realtime = trading_date == today
@@ -699,6 +715,25 @@ def monitor_single_stock(
     requested_shares = int(pos.get("base_shares", 0) * risk_params.max_t_size_ratio)
     requested_shares = (requested_shares // 100) * 100
 
+    # P0-8: 实盘风控补齐尾盘时段/单方向未配对腿/require_opposite 检查，
+    # 与回测 approve_signal 接口对齐。从 bars 推断 bar_idx/bars_count，
+    # 从 config 加载 exposure_policy。
+    from .risk import ExposurePolicy
+    from .config import load_exposure_policy
+    bars_count = len(bars)
+    bar_idx = bars_count - 1  # 最新一根 K 线
+    exposure_policy = load_exposure_policy()
+    # 实盘 open_legs：从 positions.json 的 today_t_state 推断是否有未配对敞口
+    # （实盘没有 TradeLifecycle，用 net_position_delta 符号近似 open_legs 方向）
+    net_delta = int(pos.get("today_t_state", {}).get("net_position_delta", 0))
+    live_open_legs: list[dict] = []
+    if net_delta > 0:
+        # 净增仓 = 有未配对的 buy 腿（反T先买未卖）
+        live_open_legs = [{"direction": "buy", "shares": abs(net_delta)}]
+    elif net_delta < 0:
+        # 净减仓 = 有未配对的 sell 腿（正T先卖未买）
+        live_open_legs = [{"direction": "sell", "shares": abs(net_delta)}]
+
     risk_result = check_risk(
         code=code,
         direction=direction,
@@ -706,6 +741,11 @@ def monitor_single_stock(
         signal_price=quote.get("price", 0),
         reference_price=ref_price,
         params=risk_params,
+        cost_model=cost_model,
+        bar_idx=bar_idx,
+        bars_count=bars_count,
+        open_legs=live_open_legs,
+        exposure_policy=exposure_policy,
     )
     result["risk_check"] = {
         "approved": risk_result.approved,
@@ -789,6 +829,9 @@ def monitor_main(source: str = "auto", trading_date: str = None) -> int:
     # thresholds.yaml 缺失时 config_loader 会回退到 DEFAULT_PARAMS/DEFAULT_RISK_PARAMS
     signal_params = load_signal_params()
     risk_params = load_risk_params()
+    # P0-4: 加载统一成本模型，避免风控预期价差检查与实际成交成本口径分裂
+    from .config import load_cost_model
+    cost_model = load_cost_model()
 
     # 市场层快照（跨股票共享，每轮计算一次，落盘 market_gate.json）
     # westock 为可选外部数据源：未配置 WESTOCK_DIR 时降级为独立模式
@@ -810,6 +853,7 @@ def monitor_main(source: str = "auto", trading_date: str = None) -> int:
         r = monitor_single_stock(
             code, pos, market=market,
             signal_params=signal_params, risk_params=risk_params,
+            cost_model=cost_model,
             source=source, trading_date=trading_date,
         )
         results.append(r)

@@ -333,3 +333,78 @@ def screen_hs300_baostock(
 
     eligible_list.sort(key=lambda x: x.avg_amplitude_20d or 0, reverse=True)
     return eligible_list
+
+
+def screen_all_a_baostock(
+    params: Optional[ScreenerParams] = None,
+    end_date: Optional[str] = None,
+    max_count: int = 500,
+    date_str: Optional[str] = None,
+) -> list[ScreenResult]:
+    """
+    从全 A 股批量筛选 T-eligible 候选（baostock query_all_stock）。
+
+    用 date_str 指定交易日的全 A 股列表（默认取 end_date 当天）。
+    共享单个 baostock session，避免重复 login/logout。
+    :return: 符合条件的 ScreenResult 列表（按振幅降序）
+    """
+    import baostock as bs
+    from datetime import datetime, timedelta
+
+    params = params or DEFAULT_SCREENER_PARAMS
+
+    end = datetime.strptime(end_date, "%Y-%m-%d") if end_date else datetime.now()
+    start = end - timedelta(days=35)
+    start_str = start.strftime("%Y-%m-%d")
+    end_str = end.strftime("%Y-%m-%d")
+    query_date = date_str or end_str
+
+    lg = bs.login()
+    if lg.error_code != "0":
+        print(f"[screener] baostock 登录失败: {lg.error_msg}")
+        return []
+
+    try:
+        # 查询某交易日全 A 股列表
+        rs = bs.query_all_stock(day=query_date)
+        if rs.error_code != "0":
+            print(f"[screener] 获取全A股票列表失败: {rs.error_msg}")
+            return []
+
+        all_codes = []
+        while rs.next():
+            row = rs.get_row_data()
+            code = row[0]  # sh.600000 / sz.000001
+            # 过滤：只保留沪深 A 股（sh.6 / sz.0 / sz.3），排除北交所/指数
+            if code.startswith("sh.6") or code.startswith("sz.0") or code.startswith("sz.3"):
+                name = row[2] if len(row) > 2 else ""
+                all_codes.append((code, name))
+        print(f"[screener] 全A股票共 {len(all_codes)} 只，开始批量筛选（目标 {max_count}）...")
+
+        eligible_list: list[ScreenResult] = []
+        scanned = 0
+        for i, (code, name) in enumerate(all_codes):
+            result = ScreenResult(code=code, eligible=False, reasons=[])
+            _screen_candidate_bs_core(code, params, start_str, end_str, result)
+
+            has_fail = any("✗" in r for r in result.reasons)
+            result.eligible = not has_fail and len(result.reasons) >= 2
+            scanned = i + 1
+
+            if result.eligible:
+                eligible_list.append(result)
+                print(f"  [{scanned}/{len(all_codes)}] {code} {name}  ✓ "
+                      f"振幅={result.avg_amplitude_20d*100:.2f}% "
+                      f"额={result.avg_amount_20d/1e8:.1f}亿 "
+                      f"(入选 {len(eligible_list)})")
+            elif scanned % 200 == 0:
+                print(f"  [{scanned}/{len(all_codes)}] 进度... 当前入选 {len(eligible_list)} 只")
+
+            if len(eligible_list) >= max_count:
+                print(f"[screener] 已达目标数量 {max_count}，停止（扫描了 {scanned} 只）")
+                break
+    finally:
+        bs.logout()
+
+    eligible_list.sort(key=lambda x: x.avg_amplitude_20d or 0, reverse=True)
+    return eligible_list

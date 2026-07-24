@@ -215,6 +215,13 @@ def test_intraday_reference_no_future(runner: TestRunner):
 def test_signal_engine(runner: TestRunner):
     print("\n[3] t_signal_engine — 信号触发验证")
 
+    # ⚠️ 已知漂移（非回归，与 execution 层改动无关）：以下场景 A/B 的预期与 signal 层
+    # 实际语义不符，属方案C2 之前既有问题。详见 .workbuddy/memory/2026-07-24.md。
+    #   · 场景A「冲高缩量触发 reduce」：evaluate_reduce_signal 极值层仅 vwap_dev<0
+    #     （价低于 VWAP）触发，本场景价高于 VWAP（vwap_dev>0），方向相反 → rec=none。
+    #   · 场景B「下探企稳触发 add」：open_max_vwap_dev=1.2% 上限（加仓分支设计正确）
+    #     否决深回踩，浅回踩又触发不了超卖 → rec=none。
+    #   另：evaluate_all_signals 进程内全局状态污染，通过数在 92~94 间浮动。保持现状，不修。
     # 场景 A: 冲高缩量 → 应触发减仓
     bars_spike = []
     for i in range(40):
@@ -314,11 +321,13 @@ def test_risk_guard(runner: TestRunner):
         runner.check("价差不足拒绝", not r.approved)
 
         # 4.3 卖出超量应调整
+        # P0-1 整改后 max_t_size_ratio 从 0.5 收紧至 0.25：
+        # max_shares = 3000 × 0.25 = 750 → 取整 100 倍数 = 700
         r = t_risk_guard.check_risk(
             "600xxx.SH", "sell", 5000, 12.50, 12.35,
             positions_path=pos_file,
         )
-        runner.check("超量调整到50%", r.adjusted_shares == 1500,
+        runner.check("超量调整到25%（P0-1整改）", r.adjusted_shares == 700,
                      f"got {r.adjusted_shares}")
 
         # 4.4 模拟 L1 系统性风险（创建 l1_gate.json）
@@ -658,8 +667,9 @@ def test_candidate_screener_and_config(runner: TestRunner):
         runner.check("yaml 不存在时 SignalParams fallback",
                      sig_params.vwap_dev_atr_multiplier == 0.8)
         risk_params = config_loader.load_risk_params()
+        # P0-1 整改后 min_capture_spread 默认值从 0.006 收紧至 0.0075
         runner.check("yaml 不存在时 RiskParams fallback",
-                     abs(risk_params.min_capture_spread - 0.006) < 1e-9)
+                     abs(risk_params.min_capture_spread - 0.0075) < 1e-9)
     finally:
         config_loader.CONFIG_FILE = orig_file
 
@@ -675,8 +685,11 @@ def test_candidate_screener_and_config(runner: TestRunner):
             risk_params = config_loader.load_risk_params()
             runner.check("yaml 加载 RiskParams spread=0.0075",
                          abs(risk_params.min_capture_spread - 0.0075) < 1e-9)
-            runner.check("yaml 加载 RiskParams round_trip=0.003",
-                         abs(risk_params.round_trip_cost - 0.003) < 1e-9)
+            # P0-4 整改：RiskParams.round_trip_cost 字段已删除，成本统一到 CostModel
+            # 旧断言 round_trip_cost==0.003 已移除，改验 CostModel.round_trip_cost_rate()
+            cm = config_loader.load_cost_model()
+            runner.check("yaml 加载 CostModel round_trip_rate=0.003",
+                         abs(cm.round_trip_cost_rate() - 0.003) < 1e-9)
             runner.check("yaml 加载 RiskParams max_t_size=0.25",
                          abs(risk_params.max_t_size_ratio - 0.25) < 1e-9)
         except ImportError:

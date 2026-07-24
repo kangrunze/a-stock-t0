@@ -51,22 +51,70 @@ from .sample_data import PATTERN_GENERATORS, gen_pattern
 # ═══════════════════════════════════════════════════════════════
 # 未配对敞口浮盈浮亏
 # ═══════════════════════════════════════════════════════════════
-def compute_unrealized_pnl(open_legs: list[dict], last_close: float) -> float:
+def compute_unrealized_pnl(
+    open_legs: list[dict],
+    last_close: float,
+    cost_model: Optional[CostModel] = None,
+) -> float:
     """
     计算未配对敞口的浮盈浮亏。
 
     买入腿（反T先买）：浮盈 = (最后收盘价 - 买入价) × 股数
     卖出腿（正T先卖）：浮盈 = (卖出价 - 最后收盘价) × 股数（卖出了，需要买回）
 
-    与 TradeLifecycle.unrealized_pnl 的口径完全一致。
+    P0-10 整改（2026-07-24）：传入 CostModel 时，按平仓方向扣减滑点+佣金+印花税，
+    使浮盈口径接近"若立即平仓能拿到的净额"。未传 cost_model 时保持旧口径（仅因果性
+    保持兼容，但 net_pnl_with_unrealized 会偏乐观）。
+
+    与 TradeLifecycle.unrealized_pnl 的口径区别：
+      - TradeLifecycle.unrealized_pnl：不含成本，仅遍历 open_legs（不含 expired）
+      - 本函数（传 cost_model）：含平仓成本，按 last_close 平仓模拟
     """
+    cm = cost_model or CostModel.base()
     total = 0.0
     for leg in open_legs:
-        if leg["direction"] == "buy":
-            total += (last_close - leg["fill_price"]) * leg["shares"]
+        direction = leg["direction"]
+        shares = leg["shares"]
+        fill_price = leg["fill_price"]
+        # 平仓方向 = 反向：buy 腿要卖出平仓，sell 腿要买回平仓
+        close_dir = "sell" if direction == "buy" else "buy"
+        # 含滑点的平仓价
+        close_price = cm.fill_price(close_dir, last_close)
+        # 平仓成本（佣金 + 印花税 + 冲击）
+        cost = cm.calc_cost(close_dir, shares, close_price)
+        if direction == "buy":
+            total += (close_price - fill_price) * shares - cost
         else:  # sell
-            total += (leg["fill_price"] - last_close) * leg["shares"]
+            total += (fill_price - close_price) * shares - cost
     return round(total, 2)
+
+
+# ═══════════════════════════════════════════════════════════════
+# 频率推断（P0-6: 供 _judge_trend_context 自适应 min_bars_for_trend）
+# ═══════════════════════════════════════════════════════════════
+def _infer_frequency(bars: list[dict]) -> str:
+    """
+    从 bars 的时间戳推断频率（1min/5min）。
+
+    P0-6: detect_market_regime 的 min_bars_for_trend 需按频率自适应，
+    否则 5min 数据（48根/天）永远 < 60 根阈值，趋势过滤失效。
+    """
+    if len(bars) < 2:
+        return "1min"
+
+    def _to_minutes(s: str) -> int:
+        parts = s.split(":")
+        if len(parts) >= 2:
+            try:
+                return int(parts[0]) * 60 + int(parts[1])
+            except ValueError:
+                return 0
+        return 0
+
+    diff = _to_minutes(bars[1].get("time", "")) - _to_minutes(bars[0].get("time", ""))
+    if diff <= 0:
+        return "1min"
+    return "5min" if diff >= 3 else "1min"
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -129,6 +177,11 @@ def summarize_one_stock(code: str, result: dict) -> dict:
     total_cost = sum(t.get("cost", 0) for t in trades)
     unrealized = result.get("unrealized_pnl", 0.0)
     final_legs = result.get("final_open_legs_count", 0)
+    expired_count = result.get("expired_legs_count", 0)
+    expired_pnl = result.get("expired_legs_real_pnl", 0.0)
+    net_pnl = round(gross_pnl - total_cost, 2)
+    # P3-2: net_pnl_with_unrealized 必须包含 expired 腿真实盈亏
+    net_w_u = round(net_pnl + unrealized + expired_pnl, 2)
     return {
         "code": code,
         "total_trades": len(trades),
@@ -139,9 +192,11 @@ def summarize_one_stock(code: str, result: dict) -> dict:
         "win_rate": round(len(wins) / len(paired), 4) if paired else 0.0,
         "gross_pnl": round(gross_pnl, 2),
         "total_cost": round(total_cost, 2),
-        "net_pnl": round(gross_pnl - total_cost, 2),
+        "net_pnl": net_pnl,
         "unrealized_pnl": round(unrealized, 2),
-        "net_pnl_with_unrealized": round(gross_pnl - total_cost + unrealized, 2),
+        "expired_legs_count": expired_count,          # P3-2: 超时腿总数
+        "expired_legs_real_pnl": round(expired_pnl, 2),  # P3-2: 超时腿真实盈亏
+        "net_pnl_with_unrealized": net_w_u,            # P3-2: 三项合计
         "final_open_legs_count": final_legs,
     }
 
@@ -164,6 +219,8 @@ def aggregate_batch(
     total_gross = sum(s.get("gross_pnl", 0) for s in per_stock)
     total_cost = sum(s.get("total_cost", 0) for s in per_stock)
     total_unrealized = sum(s.get("unrealized_pnl", 0) for s in per_stock)
+    total_expired_count = sum(s.get("expired_legs_count", 0) for s in per_stock)
+    total_expired_pnl = sum(s.get("expired_legs_real_pnl", 0) for s in per_stock)
     total_final_legs = sum(s.get("final_open_legs_count", 0) for s in per_stock)
     overall_wr = (total_wins / total_paired) if total_paired else 0.0
 
@@ -182,7 +239,9 @@ def aggregate_batch(
         "total_cost": round(total_cost, 2),
         "net_pnl": round(total_net, 2),
         "unrealized_pnl": round(total_unrealized, 2),
-        "net_pnl_with_unrealized": round(total_net + total_unrealized, 2),
+        "expired_legs_count": total_expired_count,          # P3-2: 超时腿总数
+        "expired_legs_real_pnl": round(total_expired_pnl, 2),  # P3-2: 超时腿真实盈亏
+        "net_pnl_with_unrealized": round(total_net + total_unrealized + total_expired_pnl, 2),
         "final_open_legs_count": total_final_legs,
         "profitable_stocks": len(profitable),
         "losing_stocks": len(losing),
@@ -250,7 +309,7 @@ class BacktestParams:
     eod_check_bar_idx: int = 200            # 14:50 对应的K线索引（约第200根）
 
     # 信号约束（防止同方向连发、强制配对闭环）
-    cooldown_bars: int = 3                  # 信号触发后N根K线内不再触发同方向信号
+    cooldown_bars: int = 6                  # 信号触发后N根K线内不再触发同方向信号（5min×6=30min，提高以降频）
     require_opposite_direction: bool = True  # 有未配对腿时只允许反方向信号
 
     # P0-2: 交易生命周期
@@ -343,6 +402,7 @@ def backtest_single_day(
     l1_systemic_risk: bool = False,
     theme_retreated: bool = False,
     initial_open_legs: Optional[list[dict]] = None,
+    initial_locked_carry: int = 0,
 ) -> dict:
     """
     对单只股票单日进行分钟级回测。
@@ -356,6 +416,8 @@ def backtest_single_day(
       l1_systemic_risk: 模拟 L1 系统性风险日（仅允许减仓）
       theme_retreated: 模拟 L2 题材退潮（禁止加仓/买回）
       initial_open_legs: 跨日延续的未配对腿（P3-1: 跨日连续配对）
+      initial_locked_carry: 昨日反T买入的 locked_shares（P0-9: T+1 解锁后
+        累加到今日 base_shares，使反T 买入的股票次日可在仓位账本卖出）
 
     返回:
     {
@@ -370,6 +432,7 @@ def backtest_single_day(
         "trades": list[dict],          # 成交明细
         "eod_status": str,             # 尾盘状态
         "final_open_legs": list[dict], # P3-1: 日终未配对腿（传给下一日）
+        "final_locked_shares": int,    # P0-9: 今日 locked_shares（传给下一日累加）
         "last_close": float,           # P3-1: 当日收盘价（用于未配对敞口估值）
     }
     """
@@ -378,11 +441,18 @@ def backtest_single_day(
     exposure_policy = params.get_exposure_policy()
     bars_count = len(bars)
 
+    # P0-9: 昨日反T买入的 locked_shares 今日 T+1 解锁，累加到 base_shares
+    # （与 execution.reset_today_state 的 locked→base 转移逻辑对齐），
+    # 使反T 买入的股票次日能在仓位账本体现为可卖底仓。
+    effective_base_shares = params.base_shares + initial_locked_carry
+
     state = BacktestState(
-        base_shares=params.base_shares,
+        base_shares=effective_base_shares,  # P0-9: 含昨日 locked 累加
         avg_cost=params.avg_cost,
         lifecycle=TradeLifecycle(max_holding_bars=params.max_holding_bars),
     )
+    # P0-6: 推断数据频率，供 _judge_trend_context 自适应 min_bars_for_trend
+    frequency = _infer_frequency(bars)
     # P3-1: 跨日延续未配对腿（FIFO 配对队列不按日重置）
     if initial_open_legs:
         state.lifecycle.import_open_legs(
@@ -402,6 +472,7 @@ def backtest_single_day(
             "trades": [],
             "eod_status": "insufficient_bars",
             "final_open_legs": state.lifecycle.export_open_legs(),
+            "final_locked_shares": state.locked_shares,  # P0-9
             "last_close": prev_close,
         }
 
@@ -414,12 +485,71 @@ def backtest_single_day(
         bar = bars[i]
         price = bar["close"]
 
-        # P0-2: 更新持仓时长和最大偏移
-        state.lifecycle.update_holding(i, price)
+        # P0-2: 更新持仓时长和最大偏移（方案C2：传盘中极值，max_adverse 用 low/high）
+        state.lifecycle.update_holding(i, price, bar.get("low"), bar.get("high"))
+
+        # 移动止损（移动止盈+固定止损兜底，在 check_expiry 之前优先平仓）
+        # 有盈利：从最高点回撤 trailing_ratio(0.5) 触发移动止盈
+        # 未盈利：固定止损 1.5% 防大亏
+        stopped_legs = state.lifecycle.check_stop_loss(i, bar, stop_loss_ratio=0.015, trailing_ratio=0.5)
+        for stp_leg in stopped_legs:
+            close_dir = "sell" if stp_leg.direction == "buy" else "buy"
+            stop_fill = stp_leg.stop_fill_price
+            if stp_leg.direction == "buy":
+                stop_real_pnl = (stop_fill - stp_leg.fill_price) * stp_leg.shares
+            else:
+                stop_real_pnl = (stp_leg.fill_price - stop_fill) * stp_leg.shares
+            # P0-FIX: 止损成交记录必须计入 state.trades + cost_reduction，
+            # 否则止损亏损被藏起（与 expired 腿统计幻觉同类问题）。
+            # check_stop_loss 已向 lifecycle.all_trades 追加，但 daily 结果
+            # 只读 state.trades，故此处补登。
+            state.trades.append({
+                "time": bar.get("time", ""),
+                "date": trading_date,
+                "direction": close_dir,
+                "shares": stp_leg.shares,
+                "fill_price": round(stop_fill, 4),
+                "cost": 0.0,  # 止损成本已在开仓时计入
+                "pnl": round(stop_real_pnl, 4),
+                "paired": True,  # 止损视为已配对（强制平仓）
+                "holding_bars": stp_leg.holding_bars,
+                "status": "stopped",
+            })
+            state.cost_reduction += stop_real_pnl
+            # 持仓方向更新（开仓已计 net_position_delta，平仓需反向冲销）
+            if close_dir == "buy":
+                state.net_position_delta += stp_leg.shares
+                # 反T买回：T+1 锁定（仅当平的是今日开仓的 sell 腿才锁定）
+                if stp_leg.fill_date == trading_date:
+                    state.locked_shares += stp_leg.shares
+            else:  # sell
+                state.net_position_delta -= stp_leg.shares
+                # 反T先买被止损卖：释放今日锁定股数
+                if stp_leg.fill_date == trading_date:
+                    state.locked_shares = max(0, state.locked_shares - stp_leg.shares)
+            state.risk_events.append({
+                "type": "stopped",
+                "direction": stp_leg.direction,
+                "shares": stp_leg.shares,
+                "fill_price": stp_leg.fill_price,
+                "holding_bars": stp_leg.holding_bars,
+                "bar_idx": i,
+                "time": bar.get("time", ""),
+                "stop_price": stop_fill,
+                "realized_pnl": round(stop_real_pnl, 2),
+            })
 
         # P0-2: 检查超时腿
         expired = state.lifecycle.check_expiry(i)
         for exp_leg in expired:
+            # P3-2: 记录 expire 时刻收盘价，用于 backtest_multi_day 统计 expired 腿真实盈亏
+            # expired 腿不进入配对结算，但其真实盈亏必须计入 net_pnl_with_unrealized
+            # 否则策略表现数字虚高（只算配对腿盈利，藏起超时腿亏损）
+            expire_close = bar["close"]
+            if exp_leg.direction == "buy":
+                exp_real_pnl = (expire_close - exp_leg.fill_price) * exp_leg.shares
+            else:  # sell
+                exp_real_pnl = (exp_leg.fill_price - expire_close) * exp_leg.shares
             state.risk_events.append({
                 "type": "expired",
                 "direction": exp_leg.direction,
@@ -428,6 +558,8 @@ def backtest_single_day(
                 "holding_bars": exp_leg.holding_bars,
                 "bar_idx": i,
                 "time": bar.get("time", ""),
+                "expire_close": expire_close,           # P3-2: 超时时刻收盘价
+                "realized_pnl": round(exp_real_pnl, 2),  # P3-2: 真实盈亏（含成本外）
             })
 
         # 涨跌停封板检测
@@ -454,6 +586,26 @@ def backtest_single_day(
         has_buy_open = any(leg.direction == "buy" for leg in state.lifecycle.open_legs)
         has_sell_open = any(leg.direction == "sell" for leg in state.lifecycle.open_legs)
 
+        # 方案C1 + 方案B：取 FIFO 队首待平仓腿的 open_vwap_dev 和 holding_ratio
+        buy_open_vwap_dev = None
+        sell_open_vwap_dev = None
+        buy_holding_ratio = 0.0
+        sell_holding_ratio = 0.0
+        if has_buy_open:
+            for leg in state.lifecycle.open_legs:
+                if leg.direction == "buy":
+                    buy_open_vwap_dev = leg.open_vwap_dev
+                    buy_holding_ratio = (leg.holding_bars / params.max_holding_bars
+                                         if params.max_holding_bars > 0 else 0.0)
+                    break
+        if has_sell_open:
+            for leg in state.lifecycle.open_legs:
+                if leg.direction == "sell":
+                    sell_open_vwap_dev = leg.open_vwap_dev
+                    sell_holding_ratio = (leg.holding_bars / params.max_holding_bars
+                                          if params.max_holding_bars > 0 else 0.0)
+                    break
+
         # 评估信号
         reduce_sig = evaluate_reduce_signal(
             bars_up_to_now,
@@ -462,6 +614,9 @@ def backtest_single_day(
             is_limit_up_locked=is_limit_up_locked,
             params=params.signal_params,
             is_for_pairing=has_buy_open,
+            open_vwap_dev=buy_open_vwap_dev if has_buy_open else None,
+            frequency=frequency,  # P0-6
+            holding_ratio=buy_holding_ratio,  # 方案B
         )
         add_sig = evaluate_add_signal(
             bars_up_to_now,
@@ -471,6 +626,9 @@ def backtest_single_day(
             theme_retreated=theme_retreated,
             params=params.signal_params,
             is_for_pairing=has_sell_open,
+            open_vwap_dev=sell_open_vwap_dev if has_sell_open else None,
+            frequency=frequency,  # P0-6
+            holding_ratio=sell_holding_ratio,  # 方案B
         )
 
         reduce_ok = reduce_sig.triggered and not is_limit_up_locked
@@ -527,6 +685,7 @@ def backtest_single_day(
         "trades": state.trades,
         "eod_status": stats["eod_status"],
         "final_open_legs": state.lifecycle.export_open_legs(),
+        "final_locked_shares": state.locked_shares,  # P0-9: 传给下一日累加
         "last_close": last_close,
         "risk_events": state.risk_events,
     }
@@ -601,6 +760,9 @@ def _execute_trade(
     state.total_cost_paid += cost
 
     # ── 第3步：配对结算（TradeLifecycle 统一处理 FIFO 配对）──
+    # 开仓时记录 open_vwap_dev，用于后续平仓的动态阈值计算（方案C1）
+    # 平仓（is_pairing）时无需记录，传 None
+    open_vwap_dev = None if signal.is_pairing else signal.snapshot.get("vwap_dev")
     trade_record = state.lifecycle.add_fill(
         direction=direction,
         shares=shares,
@@ -609,6 +771,7 @@ def _execute_trade(
         fill_date=trading_date,
         fill_bar_idx=bar_idx,
         cost=cost,
+        open_vwap_dev=open_vwap_dev,
     )
 
     # 补充信号信息
@@ -668,7 +831,10 @@ def backtest_multi_day(
     total_cost_paid = 0.0
     total_win = 0
     carry_open_legs: list[dict] = []  # P3-1: 跨日延续的未配对腿
+    carry_locked: int = 0             # P0-9: 昨日反T买入的 locked_shares（次日转 base）
     last_close = 0.0
+    expired_legs_count = 0       # P3-2: 超时腿总数
+    expired_legs_real_pnl = 0.0  # P3-2: 超时腿真实盈亏（已实现，按 expire 时刻收盘价）
 
     for date_str in sorted(daily_bars.keys()):
         bars = daily_bars[date_str]
@@ -685,6 +851,7 @@ def backtest_multi_day(
             l1_systemic_risk=date_str in l1_risk_dates,
             theme_retreated=date_str in retreated_dates,
             initial_open_legs=carry_open_legs,  # P3-1: 传入跨日腿
+            initial_locked_carry=carry_locked,  # P0-9: 传入昨日 locked 累加
         )
         daily_results.append(result)
         total_trades += result["t_trades"]
@@ -692,14 +859,24 @@ def backtest_multi_day(
         total_cost_paid += result["total_cost_paid"]
         total_win += sum(1 for t in result["trades"] if t.get("pnl", 0) > 0)
         carry_open_legs = result.get("final_open_legs", [])
+        carry_locked = result.get("final_locked_shares", 0)  # P0-9: 跨日传递
         last_close = result.get("last_close", prev_close)
+        # P3-2: 累计超时腿真实盈亏（从 risk_events 提取）
+        for ev in result.get("risk_events", []):
+            if ev.get("type") == "expired":
+                expired_legs_count += 1
+                expired_legs_real_pnl += ev.get("realized_pnl", 0.0)
 
     # P3-1: 回测结束时对未配对敞口按最后收盘价计算浮盈浮亏
     # P0-4: 委托给 backtest_metrics.compute_unrealized_pnl
-    unrealized_pnl = compute_unrealized_pnl(carry_open_legs, last_close)
+    # P0-10: 传入 cost_model，扣平仓成本和滑点（旧口径偏乐观）
+    unrealized_pnl = compute_unrealized_pnl(carry_open_legs, last_close, params.get_cost_model())
 
     win_rate = total_win / total_trades if total_trades > 0 else 0.0
     net_pnl = total_cost_reduction - total_cost_paid
+    # P3-2: net_pnl_with_unrealized 必须同时包含 expired 腿真实盈亏
+    # 旧版只含 final_open_legs 浮盈浮亏，导致 expired 腿亏损被藏起来，数字虚高
+    net_pnl_with_unrealized = round(net_pnl + unrealized_pnl + expired_legs_real_pnl, 2)
     return {
         "code": code,
         "total_days": len(daily_results),
@@ -707,8 +884,10 @@ def backtest_multi_day(
         "total_cost_reduction": total_cost_reduction,
         "total_cost_paid": total_cost_paid,
         "net_pnl": net_pnl,
-        "unrealized_pnl": unrealized_pnl,  # P3-1: 未配对敞口浮盈浮亏
-        "net_pnl_with_unrealized": round(net_pnl + unrealized_pnl, 2),  # P3-1: 含浮盈浮亏
+        "unrealized_pnl": unrealized_pnl,  # P3-1: 未配对敞口浮盈浮亏（final open legs）
+        "expired_legs_count": expired_legs_count,        # P3-2: 超时腿总数
+        "expired_legs_real_pnl": round(expired_legs_real_pnl, 2),  # P3-2: 超时腿真实盈亏
+        "net_pnl_with_unrealized": net_pnl_with_unrealized,  # P3-2: 含浮盈浮亏+超时腿盈亏
         "final_open_legs_count": len(carry_open_legs),  # P3-1: 回测结束未配对腿数
         "win_rate": win_rate,
         "avg_trades_per_day": total_trades / len(daily_results) if daily_results else 0,
@@ -902,12 +1081,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / "backtest"
 
 # 参数搜索空间
+# P1-4 整改（2026-07-24）：max_t_size_ratio 搜索空间对齐 P0-1 整改值，
+# 不再包含 0.5（50%，P0-1 整改前的旧值）；min_capture_spread 下限对齐 0.0075。
 PARAM_GRID = {
     "vwap_dev_atr_multiplier": [0.6, 0.8, 1.0],
     "rsi_overbought": [65.0, 70.0, 75.0],
     "rsi_oversold": [25.0, 30.0, 35.0],
-    "min_capture_spread": [0.004, 0.006, 0.008],
-    "max_t_size_ratio": [0.3, 0.5],
+    "min_capture_spread": [0.006, 0.0075, 0.009],
+    "max_t_size_ratio": [0.20, 0.25, 0.33],
 }
 
 # 测试形态
@@ -1060,7 +1241,13 @@ def evaluate_param_set_real(
         freq = first_meta.get("frequency", "5min")
         bpd = first_meta.get("bars_count", 48)
 
-        avg_cost = min(daily_prev.values())
+        # P0-3 整改（2026-07-24）：消除未来函数。
+        # 旧实现用 min(daily_prev.values()) 取整个区间最低昨收作底仓成本——
+        # 回测开始前就"知道"未来哪天昨收最低，底仓成本被系统性低估，
+        # 所有以底仓成本为参考的盈亏计算虚高，调优排名被污染。
+        # 改为用首日 prev_close（与 cli.run() 口径一致，因果正确）。
+        first_date = min(daily_prev.keys())
+        avg_cost = daily_prev[first_date]
         bp = BacktestParams(
             base_shares=3000,
             avg_cost=avg_cost,

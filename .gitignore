@@ -7,3 +7,5 @@ scripts/__pycache__/*.pyc
 src/at0/__pycache__/*.pyc
 src/__pycache__/*.pyc
 tests/__pycache__/*.pyc
+src/outputs/runs/*
+data/multi_day_cache/*

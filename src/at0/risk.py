@@ -523,11 +523,16 @@ L1_GATE_FILE = PROJECT_ROOT / "data" / "l1_gate.json"
 # ═══════════════════════════════════════════════════════════════
 @dataclass
 class RiskParams:
-    """L5 风控参数。当前值为合成数据调优结果，需用真实分钟数据复验。"""
-    max_t_size_ratio: float = 0.5         # 单次T仓位比例上限（底仓的 50%）
+    """L5 风控参数。
+
+    P0-1 整改（2026-07-24）：默认值对齐 config/thresholds.yaml，不再使用
+    整改前的旧值（0.5/0.006/0.001）。来回成本统一收敛到 CostModel，
+    RiskParams 不再持有 round_trip_cost 字段（见 check_risk 的 cost_model 参数）。
+    当前值为起始参考值，需用真实分钟数据复验。
+    """
+    max_t_size_ratio: float = 0.25        # 单次T仓位比例上限（底仓的 25%）
     max_t_trades_per_day: int = 4         # 每日最大T次数
-    min_capture_spread: float = 0.006     # 最小预期捕获空间（0.6%，方案 v0.2 起始值）
-    round_trip_cost: float = 0.001        # 来回成本（0.1%）
+    min_capture_spread: float = 0.0075    # 最小预期捕获空间（0.75%，扣除0.3%成本后净0.45%）
     eod_check_time: str = "14:50"         # 尾盘平衡检查时间
 
 
@@ -605,10 +610,24 @@ def check_risk(
     signal_price: float,
     reference_price: float,
     params: Optional[RiskParams] = None,
+    cost_model: Optional[CostModel] = None,
     positions_path: Path = POSITIONS_FILE,
+    bar_idx: Optional[int] = None,
+    bars_count: Optional[int] = None,
+    open_legs: Optional[list[dict]] = None,
+    exposure_policy: Optional[ExposurePolicy] = None,
 ) -> RiskCheckResult:
     """
     下单前风控检查。
+
+    P0-4 整改（2026-07-24）：成本口径统一到 CostModel，删除 RiskParams.round_trip_cost
+    字段。预期价差检查的成本显示改用 cost_model.round_trip_cost_rate()。
+    若未传 cost_model，默认用 CostModel.base()（与 thresholds.yaml 的 cost 段对齐）。
+
+    P0-8 整改（2026-07-24）：补齐尾盘时段 / 单方向未配对腿 / require_opposite
+    三项检查，与回测 approve_signal 接口对齐。这三项为可选检查——仅当传入
+    bar_idx/bars_count/exposure_policy/open_legs 时才执行，保持向后兼容。
+    实盘 monitor_single_stock 应传入这些参数以获得与回测一致的风控口径。
 
     参数:
       code: 股票代码
@@ -617,11 +636,17 @@ def check_risk(
       signal_price: 信号触发价（用于计算预期价差）
       reference_price: 参考价（VWAP 或昨收，用于计算预期捕获空间）
       params: 风控参数
+      cost_model: 统一成本模型（None 时用 CostModel.base()）
       positions_path: positions.json 路径
+      bar_idx: 当前K线索引（P0-8 尾盘时段检查用，None 跳过）
+      bars_count: 当日K线总数（P0-8 尾盘时段检查用，None 跳过）
+      open_legs: 未配对腿列表（P0-8 单方向/require_opposite 检查用，None 跳过）
+      exposure_policy: 敞口策略（P0-8 尾盘时段检查用，None 跳过）
 
     返回: RiskCheckResult
     """
     params = params or DEFAULT_RISK_PARAMS
+    cm = cost_model or CostModel.base()
     if direction not in {"buy", "sell"}:
         return RiskCheckResult(approved=False, reason=f"invalid direction: {direction}")
     if requested_shares <= 0:
@@ -664,13 +689,15 @@ def check_risk(
     checks.append(f"每日T次数：{t_trades_today}/{params.max_t_trades_per_day} ✓")
 
     # ── 检查 3: 最小预期价差 ──
+    # P0-4: 成本口径统一到 CostModel，不再用 RiskParams.round_trip_cost
     if reference_price > 0:
         expected_spread = abs(signal_price - reference_price) / reference_price
         if expected_spread < params.min_capture_spread:
             approved = False
+            round_trip = cm.round_trip_cost_rate()
             reason = (
                 f"预期价差 {expected_spread*100:.2f}% < {params.min_capture_spread*100:.1f}%"
-                f"（成本 {params.round_trip_cost*100:.1f}%）"
+                f"（成本 {round_trip*100:.1f}%）"
             )
             checks.append(f"预期价差：{expected_spread*100:.2f}% ✗")
             return RiskCheckResult(approved=False, reason=reason, checks=checks)
@@ -695,6 +722,59 @@ def check_risk(
             checks.append(f"可用底仓：调整至 {requested_shares} 股（sellable={sellable}）")
         else:
             checks.append(f"可用底仓：{requested_shares} ≤ {get_sellable_shares(code, positions_path)} ✓")
+
+    # ── 检查 4b: 尾盘时段限制（P0-8: 与 approve_signal 对齐）──
+    # 仅当传入 bar_idx/bars_count/exposure_policy 时执行（实盘 monitor 传入）
+    if (bar_idx is not None and bars_count is not None and exposure_policy is not None):
+        no_new_bar = exposure_policy.no_new_after_bar(bars_count)
+        exit_only_bar = exposure_policy.exit_only_after_bar(bars_count)
+        if bar_idx >= exit_only_bar:
+            if not open_legs:
+                return RiskCheckResult(
+                    approved=False,
+                    reason=f"14:40后无未配对腿，不允许新建仓（bar={bar_idx}）",
+                    checks=checks + [f"尾盘限制：14:40后仅退出 ✗"],
+                )
+            required_dir = "sell" if open_legs[0].get("direction") == "buy" else "buy"
+            if direction != required_dir:
+                return RiskCheckResult(
+                    approved=False,
+                    reason=f"14:40后只允许{required_dir}（退出已有敞口）",
+                    checks=checks + [f"尾盘限制：14:40后仅退出 ✗"],
+                )
+            checks.append("尾盘限制：14:40后退出已有敞口 ✓")
+        elif bar_idx >= no_new_bar:
+            if not open_legs:
+                return RiskCheckResult(
+                    approved=False,
+                    reason=f"14:20后禁止新建风险腿（bar={bar_idx}）",
+                    checks=checks + [f"尾盘限制：14:20后不新建 ✗"],
+                )
+            checks.append("尾盘限制：14:20后仅配对已有敞口 ✓")
+        else:
+            checks.append("尾盘限制：正常时段 ✓")
+
+    # ── 检查 4c: 单方向未配对腿 + require_opposite（P0-8: 与 approve_signal 对齐）──
+    if open_legs is not None and exposure_policy is not None:
+        same_dir_open = sum(1 for leg in open_legs if leg.get("direction") == direction)
+        if same_dir_open >= exposure_policy.max_open_legs_per_direction:
+            return RiskCheckResult(
+                approved=False,
+                reason=f"已有 {same_dir_open} 个 {direction} 方向未配对腿，"
+                       f"超过上限 {exposure_policy.max_open_legs_per_direction}",
+                checks=checks + [f"单方向未配对腿：{same_dir_open}/{exposure_policy.max_open_legs_per_direction} ✗"],
+            )
+        checks.append(f"单方向未配对腿：{same_dir_open}/{exposure_policy.max_open_legs_per_direction} ✓")
+
+        if exposure_policy.require_opposite_direction and open_legs:
+            required_dir = "sell" if open_legs[0].get("direction") == "buy" else "buy"
+            if direction != required_dir:
+                return RiskCheckResult(
+                    approved=False,
+                    reason=f"有未配对腿时只允许反方向（需 {required_dir}）",
+                    checks=checks + [f"方向约束：需{required_dir} ✗"],
+                )
+            checks.append(f"方向约束：{direction} 配对已有敞口 ✓")
 
     # ── 检查 5: L1 系统性风险熔断（软联动）──
     l1_risk = is_l1_systemic_risk()

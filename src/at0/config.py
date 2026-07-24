@@ -180,7 +180,7 @@ if __name__ == "__main__":
         sig = load_signal_params()
         print(f"signal params: ATR×={sig.vwap_dev_atr_multiplier}, RSI={sig.rsi_overbought}/{sig.rsi_oversold}")
         risk = load_risk_params()
-        print(f"risk params: spread={risk.min_capture_spread}, round_trip={risk.round_trip_cost}, max_t_size={risk.max_t_size_ratio}")
+        print(f"risk params: spread={risk.min_capture_spread}, max_t_size={risk.max_t_size_ratio}")
         cm = load_cost_model()
         print(f"cost model: scenario={cm.scenario}, round_trip_rate={cm.round_trip_cost_rate()}")
         ep = load_exposure_policy()

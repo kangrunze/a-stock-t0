@@ -925,17 +925,42 @@ def fetch_multi_day(
     start_date: str,
     end_date: str,
     source: str = "auto",
+    use_cache: bool = True,
 ) -> tuple[dict, dict, dict]:
     """
     拉取一段日期区间内每个交易日的分钟数据。
 
     交易日由数据源决定（拉不到的日期自动跳过）。
 
+    P3-3 数据缓存：use_cache=True 时优先从本地缓存加载，拉取后自动落盘。
+    缓存路径: data/multi_day_cache/{pure_code}_{start}_{end}.json
+    缓存命中时打印来源，跳过网络请求；缓存未命中或 use_cache=False 时走原逻辑。
+
     :return: (daily_bars, daily_prev_closes, daily_meta)
         daily_bars: {date: [bars]}
         daily_prev_closes: {date: prev_close}
         daily_meta: {date: meta}
     """
+    # P3-3: 优先从本地缓存加载
+    if use_cache:
+        nc = normalize_code(code)
+        cache_dir = PROJECT_ROOT / "data" / "multi_day_cache"
+        cache_path = cache_dir / f"{nc['pure']}_{start_date}_{end_date}.json"
+        if cache_path.exists():
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                # 校验缓存日期范围一致（防止文件名碰撞）
+                if (cached.get("start_date") == start_date
+                        and cached.get("end_date") == end_date
+                        and cached.get("code") == nc["pure"]):
+                    print(f"[data_provider] {nc['pure']} {start_date}~{end_date} "
+                          f"← 缓存({len(cached.get('daily_bars', {}))}交易日)")
+                    return (cached["daily_bars"], cached["daily_prev_closes"],
+                            cached["daily_meta"])
+            except (json.JSONDecodeError, KeyError, OSError):
+                pass  # 缓存损坏，走原逻辑重新拉取
+
     # 枚举自然日，逐日拉取（数据源会对非交易日返回空，自动跳过）
     start = datetime.strptime(start_date, "%Y-%m-%d")
     end = datetime.strptime(end_date, "%Y-%m-%d")
@@ -954,6 +979,26 @@ def fetch_multi_day(
             print(f"[data_provider] {d} ← {meta['source']}({meta['frequency']}) "
                   f"{meta['bars_count']} bars, prev_close={pc:.4f}")
         cur = _next_day(cur)
+
+    # P3-3: 拉取成功后落盘缓存
+    if use_cache and daily_bars:
+        nc = normalize_code(code)
+        cache_dir = PROJECT_ROOT / "data" / "multi_day_cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_dir / f"{nc['pure']}_{start_date}_{end_date}.json"
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "code": nc["pure"],
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "daily_bars": daily_bars,
+                    "daily_prev_closes": daily_prev_closes,
+                    "daily_meta": daily_meta,
+                }, f, ensure_ascii=False)
+            print(f"[data_provider] 缓存已保存: {cache_path.name} ({len(daily_bars)}交易日)")
+        except OSError as e:
+            print(f"[data_provider] 缓存保存失败: {e}")
 
     return daily_bars, daily_prev_closes, daily_meta
 

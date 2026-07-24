@@ -72,9 +72,15 @@ class TradeLeg:
     max_favorable: float = 0.0       # 最大有利偏移（正数）
     max_adverse: float = 0.0         # 最大不利偏移（正数）
     expire_bar_idx: Optional[int] = None  # 过期时的 K 线索引
+    open_vwap_dev: Optional[float] = None  # 开仓时刻的 vwap_dev（方案C1：用于动态平仓阈值计算）
+    stop_fill_price: Optional[float] = None  # 方案C2：止损实际成交价（触发价位，非 bar.close）
 
     def to_dict(self) -> dict:
-        """转换为字典（兼容旧 open_legs 格式）。"""
+        """转换为字典（兼容旧 open_legs 格式）。
+
+        P0-2 整改（2026-07-24）：补 open_vwap_dev 字段，确保跨日延续时
+        方案C1动态平仓阈值不丢失（否则退化为固定 floor 0.8%，过早平仓）。
+        """
         return {
             "direction": self.direction,
             "shares": self.shares,
@@ -87,11 +93,18 @@ class TradeLeg:
             "holding_bars": self.holding_bars,
             "max_favorable": round(self.max_favorable, 4),
             "max_adverse": round(self.max_adverse, 4),
+            "open_vwap_dev": self.open_vwap_dev,
+            "stop_fill_price": self.stop_fill_price,
+            "expire_bar_idx": self.expire_bar_idx,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "TradeLeg":
-        """从字典创建（兼容旧 open_legs 格式）。"""
+        """从字典创建（兼容旧 open_legs 格式）。
+
+        P0-2 整改（2026-07-24）：读回 open_vwap_dev，保持跨日腿动态平仓阈值连续。
+        旧格式无此字段时退化为 None（_compute_pairing_threshold 会退化为固定 floor）。
+        """
         return cls(
             direction=d["direction"],
             shares=d["shares"],
@@ -100,6 +113,9 @@ class TradeLeg:
             fill_date=d.get("date", ""),
             fill_bar_idx=d.get("fill_bar_idx", 0),
             cost=d.get("cost", 0.0),
+            open_vwap_dev=d.get("open_vwap_dev"),
+            stop_fill_price=d.get("stop_fill_price"),
+            expire_bar_idx=d.get("expire_bar_idx"),
         )
 
 
@@ -133,10 +149,13 @@ class TradeLifecycle:
         fill_date: str,
         fill_bar_idx: int,
         cost: float = 0.0,
+        open_vwap_dev: Optional[float] = None,
     ) -> dict:
         """
         添加一笔成交，尝试 FIFO 配对。
 
+        open_vwap_dev: 开仓时刻的 vwap_dev（仅在新开 open leg 时传入，
+                      用于后续平仓的动态阈值计算）。平仓配对时可不传。
         :return: 成交记录 dict（含 paired/pnl 字段）
         """
         pair_pnl = 0.0
@@ -182,6 +201,7 @@ class TradeLifecycle:
                 fill_date=fill_date,
                 fill_bar_idx=fill_bar_idx,
                 cost=cost,
+                open_vwap_dev=open_vwap_dev,
             )
             self.open_legs.append(new_leg)
 
@@ -201,21 +221,34 @@ class TradeLifecycle:
         return trade_record
 
     # ── 更新持仓状态 ──
-    def update_holding(self, bar_idx: int, current_price: float) -> None:
+    def update_holding(self, bar_idx: int, current_price: float,
+                       bar_low: Optional[float] = None,
+                       bar_high: Optional[float] = None) -> None:
         """
         每根 K 线调用一次，更新所有 open leg 的持仓时长和最大偏移。
+
+        方案C2（2026-07-24）：max_adverse / max_favorable 改用**盘中极值**
+        （bar.low / bar.high）而非收盘价，使止损触发反映日内真实穿透，
+        配合 check_stop_loss 按触发价成交，实现"盘中穿透即触发"。
+        bar_low / bar_high 缺失时退化为收盘价口径（向后兼容）。
         """
         for leg in self.open_legs:
             leg.holding_bars = bar_idx - leg.fill_bar_idx
 
             if leg.direction == "buy":
-                # 买腿：价格上涨有利
                 favorable = current_price - leg.fill_price
                 adverse = leg.fill_price - current_price
+                if bar_high is not None:
+                    favorable = max(favorable, bar_high - leg.fill_price)
+                if bar_low is not None:
+                    adverse = max(adverse, leg.fill_price - bar_low)
             else:
-                # 卖腿：价格下跌有利
                 favorable = leg.fill_price - current_price
                 adverse = current_price - leg.fill_price
+                if bar_low is not None:
+                    favorable = max(favorable, leg.fill_price - bar_low)
+                if bar_high is not None:
+                    adverse = max(adverse, bar_high - leg.fill_price)
 
             leg.max_favorable = max(leg.max_favorable, favorable)
             leg.max_adverse = max(leg.max_adverse, adverse)
@@ -240,12 +273,109 @@ class TradeLifecycle:
         self.open_legs = remaining_open
         return expired
 
+    # ── 检查止损（移动止盈 + 固定止损兜底）──
+    def check_stop_loss(
+        self,
+        bar_idx: int,
+        bar: dict,
+        stop_loss_ratio: float = 0.015,
+        trailing_ratio: float = 0.5,
+    ) -> list[TradeLeg]:
+        """
+        检查移动止损（移动止盈 + 固定止损兜底）。
+
+        1. 有过盈利（max_favorable > 0）：从最高点回撤 trailing_ratio(0.5) 触发移动止盈，
+           保住至少一半利润。盘中穿透即触发（bar.low/high），成交价 = 止损线。
+        2. 从未盈利：固定止损 max_adverse >= fill_price × stop_loss_ratio(1.5%) 防大亏。
+
+        v4实验（分离止盈止损，trailing=0）失败：平仓信号在5min不可靠触发，
+        盈利腿变超时/止损，胜率从82%暴跌到36%。故恢复移动止盈。
+
+        :param bar_idx: 当前 K 线索引
+        :param bar: 当前 K 线（需含 low/high）
+        :param stop_loss_ratio: 固定止损比例（默认 1.5%，仅 max_favorable==0 时生效）
+        :param trailing_ratio: 移动止盈回撤比例（默认 0.5，从最高点回撤50%触发）
+        :return: 本次止损的腿列表
+        """
+        if stop_loss_ratio <= 0 and trailing_ratio <= 0:
+            return []
+        stopped = []
+        remaining_open = []
+        bar_low = bar.get("low")
+        bar_high = bar.get("high")
+
+        for leg in self.open_legs:
+            should_stop = False
+            stop_fill = 0.0
+
+            if leg.max_favorable > 0 and trailing_ratio > 0:
+                # 移动止损：从最大有利偏移回撤超过 trailing_ratio
+                retained = leg.max_favorable * (1 - trailing_ratio)
+                if leg.direction == "buy":
+                    stop_line = leg.fill_price + retained
+                    if bar_low is not None and bar_low <= stop_line:
+                        should_stop = True
+                        stop_fill = stop_line
+                else:  # sell
+                    stop_line = leg.fill_price - retained
+                    if bar_high is not None and bar_high >= stop_line:
+                        should_stop = True
+                        stop_fill = stop_line
+            else:
+                # 固定止损：从未盈利时防大亏
+                threshold = abs(leg.fill_price) * stop_loss_ratio
+                if leg.max_adverse >= threshold:
+                    should_stop = True
+                    if leg.direction == "buy":
+                        stop_fill = leg.fill_price - threshold
+                    else:
+                        stop_fill = leg.fill_price + threshold
+
+            if should_stop:
+                leg.status = LegStatus.STOPPED
+                leg.expire_bar_idx = bar_idx
+                if leg.direction == "buy":
+                    stop_pnl = (stop_fill - leg.fill_price) * leg.shares
+                else:
+                    stop_pnl = (leg.fill_price - stop_fill) * leg.shares
+                leg.stop_fill_price = stop_fill
+                leg.paired_pnl = stop_pnl
+                close_dir = "sell" if leg.direction == "buy" else "buy"
+                self.all_trades.append({
+                    "time": f"stop@bar{bar_idx}",
+                    "date": leg.fill_date,
+                    "direction": close_dir,
+                    "shares": leg.shares,
+                    "fill_price": round(stop_fill, 4),
+                    "cost": 0.0,
+                    "pnl": round(stop_pnl, 4),
+                    "paired": True,
+                    "holding_bars": leg.holding_bars,
+                    "status": "stopped",
+                })
+                self.closed_legs.append(leg)
+                stopped.append(leg)
+            else:
+                remaining_open.append(leg)
+        self.open_legs = remaining_open
+        return stopped
+
     # ── 未配对敞口浮盈浮亏 ──
     def unrealized_pnl(self, current_price: float) -> float:
         """
-        计算所有 open leg 的浮盈浮亏。
+        计算所有 open leg 的浮盈浮亏（不含平仓成本和滑点）。
+
         买腿：(当前价 - 成本价) × 股数
         卖腿：(成本价 - 当前价) × 股数
+
+        P1-2 语义说明（2026-07-24）：
+          - 本方法仅遍历 self.open_legs，**不含已 expired 的腿**
+            （check_expiry 已把超时腿移入 closed_legs）。
+          - 若需 expired 腿的真实盈亏，从 closed_legs 中筛 LegStatus.EXPIRED
+            或从 risk_events 提取（backtest.py 已在 risk_events 累计
+            expired_legs_real_pnl，最终计入 net_pnl_with_unrealized）。
+          - 本方法不含平仓成本和滑点；如需含成本口径，用
+            backtest.compute_unrealized_pnl(open_legs, last_close, cost_model)。
         """
         total = 0.0
         for leg in self.open_legs:
