@@ -449,6 +449,11 @@ def backtest_single_day(
         # 截至当前K线的bars切片（严格因果）
         bars_up_to_now = bars[: i + 1]
 
+        # 判断是否为平仓评估（根据 open_legs 方向）
+        # 有 buy open leg 时，reduce（卖出）是平仓；有 sell open leg 时，add（买入）是平仓
+        has_buy_open = any(leg.direction == "buy" for leg in state.lifecycle.open_legs)
+        has_sell_open = any(leg.direction == "sell" for leg in state.lifecycle.open_legs)
+
         # 评估信号
         reduce_sig = evaluate_reduce_signal(
             bars_up_to_now,
@@ -456,6 +461,7 @@ def backtest_single_day(
             prev_close=prev_close,
             is_limit_up_locked=is_limit_up_locked,
             params=params.signal_params,
+            is_for_pairing=has_buy_open,
         )
         add_sig = evaluate_add_signal(
             bars_up_to_now,
@@ -464,6 +470,7 @@ def backtest_single_day(
             is_limit_down_locked=is_limit_down_locked,
             theme_retreated=theme_retreated,
             params=params.signal_params,
+            is_for_pairing=has_sell_open,
         )
 
         reduce_ok = reduce_sig.triggered and not is_limit_up_locked
@@ -571,8 +578,11 @@ def _execute_trade(
         return
 
     # 预期价差检查（使用统一成本模型的净收益率）
-    if ref_price > 0:
-        expected_spread = abs(price - ref_price) / ref_price
+    # 平仓（is_pairing）跳过 min_capture_spread：平仓时价格已回归 VWAP 附近，
+    # |price - vwap| 小，该检查对平仓无意义（平仓的盈利来自开仓价与平仓价的价差，
+    # 不是当前价与 vwap 的偏离）。开仓仍需检查（确保在极端开仓）。
+    expected_spread = abs(price - ref_price) / ref_price if ref_price > 0 else 0.0
+    if ref_price > 0 and not signal.is_pairing:
         if expected_spread < params.risk_params.min_capture_spread:
             return
 

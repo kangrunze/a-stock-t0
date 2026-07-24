@@ -101,6 +101,13 @@ class SignalParams:
     extreme_min: int = 2                    # 极值层至少满足项数
     confirm_min: int = 1                    # 确认层至少满足项数
 
+    # Layer P — 平仓层（is_for_pairing=True 时使用）
+    # 平仓不要求"对向出现极端"，改用"价格回归 VWAP 附近 + 轻量方向确认"。
+    # 均值回归的获利了结定义：价格从极端回归到均值附近即平仓，
+    # 不需要价格在反方向也出现一次极端（那是更少见的事件，导致配对率崩塌）。
+    pairing_vwap_dev_threshold: float = 0.008  # |VWAP偏离| < 此值视为价格已回归均值（0.8%）
+    pairing_no_new_extreme_bars: int = 2       # 连续 N 根 K 线不创新极值（轻量方向确认，防单根噪声误触发）
+
 
 DEFAULT_PARAMS = SignalParams()
 
@@ -126,12 +133,25 @@ class TSignal:
     filter_passed: bool = True              # 环境层过滤是否通过
     extreme_min: int = 2                    # 极值层最少项数
     confirm_min: int = 1                    # 确认层最少项数
+    # Layer P: 平仓层（is_for_pairing=True 时使用）
+    is_pairing: bool = False                 # 是否为平仓评估（vs 新开仓评估）
+    pairing_near_vwap: bool = False          # 平仓：价格已回归 VWAP 附近
+    pairing_direction_confirmed: bool = False  # 平仓：轻量方向确认（不创新极值）
 
     @property
     def triggered(self) -> bool:
-        """P0-5 三层触发条件：环境层通过 + 极值≥extreme_min + 确认≥confirm_min + 总分≥阈值。"""
+        """
+        触发条件：
+        - 平仓分支（is_pairing=True）：环境层通过 + 价格回归VWAP附近 + 轻量方向确认
+          （不走三层 confluence，因为均值回归的平仓定义是"价格回归均值"而非"对向出现极端"）
+        - 开仓分支（is_pairing=False）：环境层通过 + 极值≥extreme_min + 确认≥confirm_min + 总分≥阈值
+        """
         if not self.filter_passed:
             return False
+        if self.is_pairing:
+            # 平仓分支：距离判断 + 方向确认（不走三层 confluence）
+            return self.pairing_near_vwap and self.pairing_direction_confirmed
+        # 开仓分支：三层 confluence
         if self.extreme_score < self.extreme_min:
             return False
         if self.confirm_score < self.confirm_min:
@@ -144,6 +164,32 @@ class TSignal:
         if self.direction == "reduce":
             return "正T-卖出 / 反T-买回"
         return "反T-买入 / 正T-买回"
+
+
+# ═══════════════════════════════════════════════════════════════
+# 平仓层辅助：轻量方向确认（连续 N 根 K 线不创新极值）
+# ═══════════════════════════════════════════════════════════════
+def _no_new_extreme_recently(bars: list[dict], direction: str, lookback: int) -> bool:
+    """
+    轻量方向确认：最近 lookback 根 K 线不再创新极值。
+
+    - direction="reduce"（卖出平 buy 仓）：最近 lookback 根 K 线的 high 都 ≤ 之前的高点
+      （价格不再创新高，上行已停滞，适合获利了结卖出）
+    - direction="add"（买回平 sell 仓）：最近 lookback 根 K 线的 low 都 ≥ 之前的低点
+      （价格不再创新低，下行已停滞，适合获利了结买回）
+
+    防止单根 K 线的噪声误触发平仓信号。
+    """
+    if len(bars) < lookback + 1:
+        return False
+    prior = bars[:-lookback]
+    recent = bars[-lookback:]
+    if direction == "reduce":
+        prior_high = max(b["high"] for b in prior) if prior else 0
+        return all(b["high"] <= prior_high for b in recent)
+    else:  # add
+        prior_low = min(b["low"] for b in prior) if prior else float("inf")
+        return all(b["low"] >= prior_low for b in recent)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -189,19 +235,18 @@ def evaluate_reduce_signal(
     is_limit_up_locked: bool = False,
     params: Optional[SignalParams] = None,
     quote_feats: Optional[dict] = None,
+    is_for_pairing: bool = False,
 ) -> TSignal:
     """
-    减仓信号评估（P0-5 三层结构）。
+    减仓信号评估。
 
-    极值层（≥2项）:
-      项1 VWAP偏离度 ≥ +0.8×ATR_intraday（相对值）
-      项2 KDJ.K > 80 或 RSI(14) > 70（OR 合并为一项）
-      项2b MFI > 80（资金超买）
-    确认层（≥1项）:
-      项3 当前5分钟量能 < 过去20分钟均量×0.8（缩量冲高）或 主动卖占比>0.55（卖压）
-    环境层（必须通过）:
-      项4 未处于涨停封板状态
-      趋势过滤（P0-6：extreme 硬否决，trend_up 逆势加严）
+    - is_for_pairing=False（默认，新开仓）：P0-5 三层结构（极值≥2 + 确认≥1 + 环境通过）
+    - is_for_pairing=True（为配对已有 buy 仓位）：平仓层
+      距离判断（价格回归 VWAP 附近）+ 轻量方向确认（不再创新高）
+      环境层仍需通过（未涨停封板、非极端趋势）
+
+    平仓分支的语义：均值回归的获利了结 = 价格从极端回归到均值附近，
+    不要求"对向出现极端"（那是更少见的事件，会导致配对率崩塌）。
     """
     params = params or DEFAULT_PARAMS
     snap = compute_reference_snapshot(bars, current_price, prev_close)
@@ -224,6 +269,46 @@ def evaluate_reduce_signal(
     prior_20_vol_avg = snap.get("prior_20_vol_avg")
 
     trend_ctx = _judge_trend_context(snap, params)
+
+    # ═══ 平仓分支（is_for_pairing=True）：距离判断 + 轻量方向确认 ═══
+    if is_for_pairing:
+        filter_passed = not is_limit_up_locked
+        near_vwap = (vwap is not None and vwap > 0 and vwap_dev is not None
+                     and abs(vwap_dev) < params.pairing_vwap_dev_threshold)
+        dir_confirmed = _no_new_extreme_recently(bars, "reduce", params.pairing_no_new_extreme_bars)
+        fired_pairing = []
+        if near_vwap:
+            fired_pairing.append(f"[平仓-距离] |VWAP偏离|={abs(vwap_dev)*100:.2f}% < {params.pairing_vwap_dev_threshold*100:.1f}%（已回归均值）")
+        else:
+            fired_pairing.append(f"[平仓-距离] |VWAP偏离|={abs(vwap_dev)*100:.2f}% ≥ {params.pairing_vwap_dev_threshold*100:.1f}%（未回归）")
+        if dir_confirmed:
+            fired_pairing.append(f"[平仓-方向确认] 最近{params.pairing_no_new_extreme_bars}根K线未创新高")
+        else:
+            fired_pairing.append(f"[平仓-方向确认] 最近{params.pairing_no_new_extreme_bars}根K线有新高（仍在冲高）")
+        if not filter_passed:
+            fired_pairing.append("[环境4] 涨停封板（硬否决）")
+        else:
+            fired_pairing.append("[环境4] 未涨停封板（可成交）")
+        return TSignal(
+            direction="reduce",
+            rules_fired=fired_pairing,
+            rules_score=2 if (near_vwap and dir_confirmed and filter_passed) else 0,
+            price=price,
+            snapshot=snap,
+            layer_scores={"pairing_distance": 1 if near_vwap else 0,
+                          "pairing_direction": 1 if dir_confirmed else 0,
+                          "filter": 1 if filter_passed else 0},
+            trend_context=trend_ctx,
+            trigger_threshold=2,  # 平仓分支走自己的触发逻辑，不走 trigger_threshold
+            extreme_score=0,
+            confirm_score=0,
+            filter_passed=filter_passed,
+            extreme_min=params.extreme_min,
+            confirm_min=params.confirm_min,
+            is_pairing=True,
+            pairing_near_vwap=near_vwap,
+            pairing_direction_confirmed=dir_confirmed,
+        )
 
     # ── 极值层 项1: VWAP 偏离度 ≥ +0.8 × ATR_intraday（相对值）──
     if vwap and vwap > 0 and atr and atr > 0:
@@ -315,19 +400,18 @@ def evaluate_add_signal(
     theme_retreated: bool = False,
     params: Optional[SignalParams] = None,
     quote_feats: Optional[dict] = None,
+    is_for_pairing: bool = False,
 ) -> TSignal:
     """
-    加仓/买回信号评估（P0-5 三层结构）。
+    加仓/买回信号评估。
 
-    极值层（≥2项）:
-      项1 VWAP偏离度 ≤ -0.8×ATR 或 跌破开盘区间下轨 或 跌破布林带下轨（OR）
-      项2 KDJ.K < 20 或 RSI(14) < 30（OR 合并为一项）
-      项2b MFI < 20（资金超卖）
-    确认层（≥1项）:
-      项3 连续缩量且不再创新低（地量企稳）或 主动买占比>0.55（买盘）
-    环境层（必须通过）:
-      项4 所属板块未退潮 且 未跌停封板
-      趋势过滤（P0-6：extreme 硬否决，trend_down 不接飞刀加严）
+    - is_for_pairing=False（默认，新开仓）：P0-5 三层结构（极值≥2 + 确认≥1 + 环境通过）
+    - is_for_pairing=True（为配对已有 sell 仓位）：平仓层
+      距离判断（价格回归 VWAP 附近）+ 轻量方向确认（不再创新低）
+      环境层仍需通过（未跌停封板、板块未退潮）
+
+    平仓分支的语义：均值回归的获利了结 = 价格从极端回归到均值附近，
+    不要求"对向出现极端"（那是更少见的事件，会导致配对率崩塌）。
     """
     params = params or DEFAULT_PARAMS
     snap = compute_reference_snapshot(bars, current_price, prev_close)
@@ -351,6 +435,51 @@ def evaluate_add_signal(
     consecutive_shrink = snap.get("consecutive_shrink_no_new_low")
 
     trend_ctx = _judge_trend_context(snap, params)
+
+    # ═══ 平仓分支（is_for_pairing=True）：距离判断 + 轻量方向确认 ═══
+    if is_for_pairing:
+        filter_passed = (not theme_retreated) and (not is_limit_down_locked)
+        near_vwap = (vwap is not None and vwap > 0 and vwap_dev is not None
+                     and abs(vwap_dev) < params.pairing_vwap_dev_threshold)
+        dir_confirmed = _no_new_extreme_recently(bars, "add", params.pairing_no_new_extreme_bars)
+        fired_pairing = []
+        if near_vwap:
+            fired_pairing.append(f"[平仓-距离] |VWAP偏离|={abs(vwap_dev)*100:.2f}% < {params.pairing_vwap_dev_threshold*100:.1f}%（已回归均值）")
+        else:
+            fired_pairing.append(f"[平仓-距离] |VWAP偏离|={abs(vwap_dev)*100:.2f}% ≥ {params.pairing_vwap_dev_threshold*100:.1f}%（未回归）")
+        if dir_confirmed:
+            fired_pairing.append(f"[平仓-方向确认] 最近{params.pairing_no_new_extreme_bars}根K线未创新低")
+        else:
+            fired_pairing.append(f"[平仓-方向确认] 最近{params.pairing_no_new_extreme_bars}根K线有新低（仍在下探）")
+        if not filter_passed:
+            reason = []
+            if theme_retreated:
+                reason.append("板块退潮")
+            if is_limit_down_locked:
+                reason.append("跌停封板")
+            fired_pairing.append(f"[环境4] {'+'.join(reason)}（硬否决）")
+        else:
+            fired_pairing.append("[环境4] 板块未退潮且未跌停封板（可成交）")
+        return TSignal(
+            direction="add",
+            rules_fired=fired_pairing,
+            rules_score=2 if (near_vwap and dir_confirmed and filter_passed) else 0,
+            price=price,
+            snapshot=snap,
+            layer_scores={"pairing_distance": 1 if near_vwap else 0,
+                          "pairing_direction": 1 if dir_confirmed else 0,
+                          "filter": 1 if filter_passed else 0},
+            trend_context=trend_ctx,
+            trigger_threshold=2,
+            extreme_score=0,
+            confirm_score=0,
+            filter_passed=filter_passed,
+            extreme_min=params.extreme_min,
+            confirm_min=params.confirm_min,
+            is_pairing=True,
+            pairing_near_vwap=near_vwap,
+            pairing_direction_confirmed=dir_confirmed,
+        )
 
     # ── 极值层 项1: VWAP偏离度 ≤ -0.8×ATR 或 跌破开盘区间下轨 或 跌破布林带下轨（OR）──
     pos_fired = False
